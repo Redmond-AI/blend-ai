@@ -13,9 +13,10 @@ The pinned commit is tagged `v1.2.2`, but `pyproject.toml`,
 source version `1.2.1`. This fork records the discrepancy rather than silently
 changing upstream's package version.
 
-The final tested fork commit SHA must be recorded here after the implementation
-commits are finalized. The pinned SHA above is the upstream base, not the fork's
-final release commit.
+The six-commit implementation and test tree was tested at fork commit
+`c356372d81115d739766b2f2e2d59c07d6ea8402`. The pinned SHA above is the
+upstream base, not the tested fork commit. This installation-note-only child
+commit does not change executable or test code.
 
 ## Verified local installation
 
