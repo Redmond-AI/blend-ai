@@ -2,6 +2,7 @@
 
 import re
 import os
+import math
 from pathlib import Path
 
 # Allowed file extensions for import/export
@@ -74,8 +75,12 @@ def validate_file_path(path: str, allowed_extensions: set[str] | None = None, mu
 
 def validate_numeric_range(value: float | int, min_val: float | int | None = None, max_val: float | int | None = None, name: str = "value") -> float | int:
     """Validate a numeric value is within range."""
-    if not isinstance(value, (int, float)):
+    # bool is an int subclass, but accepting True as an energy/sample count is
+    # surprising and makes structured tool validation less reliable.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{name} must be a number")
+    if not math.isfinite(value):
+        raise ValidationError(f"{name} must be finite")
     if min_val is not None and value < min_val:
         raise ValidationError(f"{name} must be >= {min_val}, got {value}")
     if max_val is not None and value > max_val:
@@ -90,7 +95,13 @@ def validate_color(color: list | tuple) -> tuple:
     if len(color) not in (3, 4):
         raise ValidationError("Color must have 3 (RGB) or 4 (RGBA) components")
     for i, c in enumerate(color):
-        if not isinstance(c, (int, float)) or c < 0.0 or c > 1.0:
+        if (
+            isinstance(c, bool)
+            or not isinstance(c, (int, float))
+            or not math.isfinite(c)
+            or c < 0.0
+            or c > 1.0
+        ):
             raise ValidationError(f"Color component {i} must be a float between 0.0 and 1.0")
     return tuple(color)
 
@@ -102,8 +113,10 @@ def validate_vector(vec: list | tuple, size: int = 3, name: str = "vector") -> t
     if len(vec) != size:
         raise ValidationError(f"{name} must have exactly {size} components")
     for i, v in enumerate(vec):
-        if not isinstance(v, (int, float)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
             raise ValidationError(f"{name} component {i} must be a number")
+        if not math.isfinite(v):
+            raise ValidationError(f"{name} component {i} must be finite")
     return tuple(vec)
 
 
