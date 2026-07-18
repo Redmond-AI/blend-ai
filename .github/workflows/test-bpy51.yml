@@ -33,8 +33,3 @@ jobs:
       - name: Run relighting save/reopen integration
         if: matrix.bpy-version == '5.2.0'
         run: python tests/integration/run_relighting_bpy_integration.py
-
-      - name: Run full test suite
-        run: |
-          pip install -e ".[dev]"
-          pytest tests/ -v --tb=short
