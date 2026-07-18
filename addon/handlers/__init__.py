@@ -24,6 +24,8 @@ from . import (
     mesh_editing,
     mesh_quality,
     gpencil,
+    relighting,
+    cycles_viewport,
 )
 
 _modules = [
@@ -50,6 +52,8 @@ _modules = [
     code_exec,
     booltool,
     gpencil,
+    relighting,
+    cycles_viewport,
 ]
 
 
