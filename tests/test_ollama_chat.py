@@ -3,6 +3,7 @@
 import json
 import pytest
 from unittest.mock import MagicMock, patch
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from blend_ai.ollama_chat import (
     BlenderChatSession,
@@ -153,6 +154,33 @@ class TestBlenderChatSession:
             result = session.execute_tool("create_object", {"type": "CUBE"})
             parsed = json.loads(result)
             assert parsed["status"] == "error"
+
+    def test_execute_tool_preserves_native_image_content(
+        self, mock_ollama_client, mock_blender_connection
+    ):
+        """Mixed MCP image/text results remain usable by the Ollama adapter."""
+        call_result = CallToolResult(
+            content=[
+                ImageContent(type="image", data="encoded-image", mimeType="image/jpeg"),
+                TextContent(type="text", text='{"camera_name":"Camera"}'),
+            ],
+            structuredContent={"camera_name": "Camera"},
+        )
+
+        async def _fake_call_tool(name, args):
+            return call_result
+
+        with patch("blend_ai.server.mcp") as mock_mcp:
+            mock_mcp.call_tool = _fake_call_tool
+            session = BlenderChatSession()
+            result = json.loads(session.execute_tool("capture_cycles_viewport", {}))
+
+        assert result["content"][0] == {
+            "type": "image",
+            "data": "encoded-image",
+            "mime_type": "image/jpeg",
+        }
+        assert result["structured_content"] == {"camera_name": "Camera"}
 
     def test_chat_simple_response(
         self, mock_ollama_client, mock_blender_connection, mock_mcp_tools

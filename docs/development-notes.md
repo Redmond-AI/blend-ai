@@ -1,0 +1,81 @@
+# Development and installation notes
+
+## Provenance
+
+- Public fork: `https://github.com/Redmond-AI/blend-ai`
+- `origin`: the public fork above
+- `upstream`: `https://github.com/HoldMyBeer-gg/blend-ai.git`
+- Development branch: `codex/relighting-tools`
+- Pinned upstream base: `621ddc0dc8b379428e027c17ce817e1fc4d9cb36`
+
+The pinned commit is tagged `v1.2.2`, but `pyproject.toml`,
+`addon/blender_manifest.toml`, and the legacy `bl_info` metadata all report
+source version `1.2.1`. This fork records the discrepancy rather than silently
+changing upstream's package version.
+
+The final tested fork commit SHA must be recorded here after the implementation
+commits are finalized. The pinned SHA above is the upstream base, not the fork's
+final release commit.
+
+## Verified local installation
+
+The developer checkout is:
+
+`/Users/robingraham/Library/CloudStorage/Dropbox/github/blend-ai-relighting`
+
+The Blender 5.2 developer extension is a symlink:
+
+`/Users/robingraham/Library/Application Support/Blender/5.2/extensions/user_default/blend_ai`
+
+It points to the checkout's `addon` directory. Refuse to replace an unverified
+directory or a symlink with a different target. After any add-on source change,
+stop the N-panel server, quit Blender completely, and relaunch it; Reload Scripts
+is insufficient because the background TCP thread can survive module reloads.
+
+The Codex Desktop MCP entry launches the locked environment with:
+
+```toml
+[mcp_servers.blend_ai_relighting]
+command = "/Users/robingraham/.local/bin/uv"
+args = [
+  "run",
+  "--directory",
+  "/Users/robingraham/Library/CloudStorage/Dropbox/github/blend-ai-relighting",
+  "blend-ai"
+]
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+enabled = true
+```
+
+The server dependency lock currently tests MCP Python SDK `1.28.1`, Pillow
+`12.3.0`, and Pydantic `2.12.5` under Python `3.13`. The Blender extension
+remains zero-dependency. Blender's add-on server binds only to `127.0.0.1:9876`.
+
+## Acceptance status
+
+The deterministic warehouse has passed both native image paths through the MCP
+protocol: an 8-sample denoised PNG quick render and a 16-sample, two-second
+denoised JPEG visible-viewport capture. The 20,000-instance scale fixture also
+passes functionally. Current measured target misses are:
+
+- Warm visible-viewport overhead is about 1.9 seconds beyond the requested
+  settle interval, versus the initial under-one-second target.
+- A 64-light apply takes 395.64 ms, versus the initial under-250 ms target.
+
+Detailed final measurements and ignored local evidence paths are in
+[`relighting.md`](relighting.md). The real warehouse gate is intentionally still
+open until a duplicate scene path is supplied. Do not merge a release or claim
+full acceptance before that test, rollback verification, and final commit-SHA
+recording are complete.
+
+## Capture and transaction cautions
+
+- `capture_mode="VIEWPORT"` returns visible Cycles editor pixels and leaves
+  `Render Result` alone.
+- `capture_mode="QUICK_RENDER"` is explicit only. It uses denoising, updates
+  `Render Result`, removes its temporary source PNG, and never saves the
+  `.blend` file. It is not a silent fallback for failed viewport capture.
+- Managed transaction rollback is global LIFO. Whole-scene relighting snapshots
+  must be unwound newest first, even when transactions belong to different
+  plan IDs.

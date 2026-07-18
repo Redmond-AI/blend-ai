@@ -10,7 +10,7 @@ The most intuitive and efficient MCP Server for Blender. Control Blender entirel
 
 ## Key Features
 
-- **164 tools** across 24 modules covering every major Blender domain: modeling, mesh editing, materials, shader nodes, lighting, camera, animation, rendering, sculpting, UV mapping, physics, geometry nodes, rigging, curves, annotations, collections, file I/O, Bool Tool, viewport control, mesh quality analysis, and extension suggestions
+- **170 tools** across 25 modules covering every major Blender domain: modeling, mesh editing, materials, shader nodes, lighting, camera, animation, rendering, sculpting, UV mapping, physics, geometry nodes, rigging, curves, annotations, collections, file I/O, Bool Tool, viewport control, mesh quality analysis, spatial relighting, and extension suggestions
 - **12 expert prompts** — topology best practices, real-world scale references, lighting principles, studio setup, character basemesh workflow, PBR material guide, auto-critique feedback loop, and more
 - **Visual feedback loop** — fast viewport screenshots via OpenGL render (~ms, not seconds) with auto-critique prompts that guide the LLM to check its own work
 - **Mesh quality analysis** — structured reports covering non-manifold edges, loose vertices, zero-area faces, duplicate vertices, and wire edges
@@ -22,7 +22,7 @@ The most intuitive and efficient MCP Server for Blender. Control Blender entirel
 - **Zero telemetry** — no usage tracking, no analytics, no data collection. Everything runs locally on `127.0.0.1`
 - **Zero-dependency addon** — the Blender addon uses only Python stdlib + `bpy`. Nothing to pip install inside Blender
 - **Thread-safe architecture** — background TCP server with queue-based main-thread execution, TCP keepalive for stale connection detection
-- **1190 tests** — comprehensive coverage across tools, handlers, validators, prompts, and the cross-platform installer (ubuntu/macos/windows × py3.11/3.13 in CI)
+- **1,400+ tests** — comprehensive coverage across tools, handlers, validators, prompts, relighting transactions, and the cross-platform installer
 
 ## Quickstart
 
@@ -169,12 +169,12 @@ blend-ai includes 12 MCP prompts that guide the LLM toward professional-quality 
 ## Tool Domains
 
 <details>
-<summary><strong>All 164 tools across 24 modules</strong></summary>
+<summary><strong>All 170 tools across 25 modules</strong></summary>
 
 | Domain | Tools | Highlights |
 |--------|-------|-----------|
 | Scene | 6 | Get scene info, set frame range, manage scenes, suggest helpful extensions |
-| Objects | 14 | Create primitives, duplicate, parent, join, visibility, origin, convert, auto-smooth |
+| Objects | 16 | Create primitives, duplicate, parent, join, visibility, origin, convert, auto-smooth |
 | Transforms | 6 | Position, rotation (euler/quat), scale, apply, snap |
 | Modeling | 13 | Modifiers, booleans, subdivide, extrude, bevel, loop cut, bridge edge loops |
 | Mesh Editing | 16 | Inset, fill, grid fill, mark seam/sharp, normals, dissolve, knife project, spin, crease |
@@ -196,6 +196,7 @@ blend-ai includes 12 MCP prompts that guide the LLM toward professional-quality 
 | File I/O | 5 | Import/export (FBX, OBJ, glTF, USD, STL...), save/open |
 | Viewport | 3 | Shading mode, overlays, focus on object |
 | Screenshot | 1 | Fast viewport capture (OpenGL) or full render, base64 output |
+| Spatial Relighting | 4 | Evaluated context, batch raycasts, managed light transactions, native Cycles images |
 | Code Exec | 1 | Sandboxed Python execution in Blender (dangerous imports blocked) |
 
 </details>
@@ -205,6 +206,22 @@ blend-ai includes 12 MCP prompts that guide the LLM toward professional-quality 
 ```
 AI Assistant <--stdio/MCP--> blend-ai server <--TCP socket--> Blender addon <--bpy--> Blender
 ```
+
+### Spatial relighting fork
+
+This fork adds four opt-in tools for large-scene relighting:
+`get_lighting_context`, `batch_raycast`, `apply_light_plan`, and
+`capture_cycles_viewport`. They provide evaluated spatial context, line-of-sight
+checks, transaction-backed managed lights, and a native MCP image captured from
+a visible Cycles Rendered viewport. An explicit low-sample, denoised quick-render
+mode is also available when replacing Blender's `Render Result` is acceptable;
+it is never an automatic fallback and never saves the `.blend` file. Managed
+relighting rollback is global LIFO so newer whole-scene snapshots cannot be
+silently overwritten. Existing screenshot and upstream tool contracts remain
+unchanged. See [`docs/relighting.md`](docs/relighting.md) for setup, safety
+guarantees, verified Mac results, and the visual iteration loop, and
+[`docs/development-notes.md`](docs/development-notes.md) for the pinned base and
+local developer installation.
 
 <details>
 <summary><strong>How it works</strong></summary>
@@ -261,7 +278,7 @@ AI Assistant <--stdio/MCP--> blend-ai server <--TCP socket--> Blender addon <--b
 # Install with dev dependencies
 uv pip install -e ".[dev]"
 
-# Run tests (1190 tests)
+# Run the full test suite
 uv run --extra dev pytest
 
 # Run tests with coverage
@@ -283,7 +300,7 @@ blend-ai/
 │   ├── server.py           # FastMCP entry point
 │   ├── connection.py       # TCP client to Blender (with busy-retry)
 │   ├── validators.py       # Input validation
-│   ├── tools/              # 24 tool modules (164 tools)
+│   ├── tools/              # 25 tool modules (170 tools)
 │   ├── resources/          # MCP resources (scene, objects, materials)
 │   └── prompts/            # 12 expert prompt templates
 ├── addon/                  # Blender addon (zero external deps)
@@ -294,8 +311,8 @@ blend-ai/
 │   ├── thread_safety.py    # Main-thread execution queue
 │   ├── render_guard.py     # Render state tracking + crash recovery
 │   ├── ui_panel.py         # N-panel UI (start/stop + port config)
-│   └── handlers/           # 23 handler modules
-└── tests/                  # 1186 unit tests
+│   └── handlers/           # 25 handler modules
+└── tests/                  # 1,400+ automated tests
 ```
 
 </details>
