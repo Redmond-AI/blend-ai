@@ -12,6 +12,7 @@ import sys
 import tempfile
 
 import bpy
+from mathutils import Vector
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -21,11 +22,7 @@ from addon.handlers import relighting  # noqa: E402
 
 
 def _managed_lights() -> list[bpy.types.Object]:
-    return [
-        obj
-        for obj in bpy.context.scene.objects
-        if relighting._is_managed_light(obj)
-    ]
+    return [obj for obj in bpy.context.scene.objects if relighting._is_managed_light(obj)]
 
 
 def _point_spec(energy: float) -> dict[str, object]:
@@ -57,9 +54,7 @@ def main() -> None:
     if bpy.data.filepath:
         raise RuntimeError(f"Refusing to reset loaded file {bpy.data.filepath!r}")
     if bpy.app.binary_path and "--confirm-isolated-process" not in sys.argv:
-        raise RuntimeError(
-            "A Blender executable run requires --confirm-isolated-process"
-        )
+        raise RuntimeError("A Blender executable run requires --confirm-isolated-process")
     scene = _reset_scene()
     scene.name = "Relighting bpy Integration"
     original_world = bpy.data.worlds.new("Artist Original World")
@@ -104,6 +99,7 @@ def main() -> None:
     replacement.update(
         {
             "type": "AREA",
+            "location_world": [4.0, 5.0, 6.0],
             "target_point": [1.0, 2.0, 0.0],
             "size": 2.0,
             "area_shape": "DISK",
@@ -119,6 +115,9 @@ def main() -> None:
     )
     assert light.data.energy == 800.0
     assert light.data.type == "AREA"
+    expected_direction = (Vector((1.0, 2.0, 0.0)) - Vector((4.0, 5.0, 6.0))).normalized()
+    actual_direction = (light.rotation_quaternion @ Vector((0.0, 0.0, -1.0))).normalized()
+    assert actual_direction.dot(expected_direction) > 0.999999
     ledger = bpy.data.texts.get(relighting.LEDGER_TEXT)
     assert ledger is not None
     assert bool(ledger.get(relighting.LEDGER_PROP, False))

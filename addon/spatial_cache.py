@@ -28,6 +28,7 @@ _managed_edit_depth = 0
 _render_evaluation_depth = 0
 _recent_update_batches: list[dict[str, Any]] = []
 MANAGED_PROP = "blend_ai_relight_managed"
+PROFILE_MANAGED_PROPS = ("blend_ai_managed", "blend_ai_look_managed")
 
 try:
     _persistent = bpy.app.handlers.persistent
@@ -200,7 +201,9 @@ def _is_managed(value: Any) -> bool:
     if not callable(getter):
         return False
     try:
-        return bool(getter(MANAGED_PROP, False))
+        return bool(getter(MANAGED_PROP, False)) or any(
+            bool(getter(key, False)) for key in PROFILE_MANAGED_PROPS
+        )
     except Exception:
         return False
 
@@ -309,7 +312,8 @@ def depsgraph_update_post(_scene: Any, depsgraph: Any) -> None:
                 suppressed_by_render = True
         if managed_grace and geometry:
             if (
-                "collection" in normalized_kind
+                _is_managed(value)
+                or "collection" in normalized_kind
                 or "viewlayer" in normalized_kind
                 or "scene" in normalized_kind
             ):

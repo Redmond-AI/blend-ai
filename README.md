@@ -10,14 +10,16 @@ The most intuitive and efficient MCP Server for Blender. Control Blender entirel
 
 ## Key Features
 
-- **170 tools** across 25 modules covering every major Blender domain: modeling, mesh editing, materials, shader nodes, lighting, camera, animation, rendering, sculpting, UV mapping, physics, geometry nodes, rigging, curves, annotations, collections, file I/O, Bool Tool, viewport control, mesh quality analysis, spatial relighting, and extension suggestions
+- **179 tools** across 27 modules covering every major Blender domain: modeling, mesh editing, materials, shader nodes, lighting, camera, animation, rendering, sculpting, UV mapping, physics, geometry nodes, rigging, curves, annotations, collections, file I/O, Bool Tool, viewport control, mesh quality analysis, spatial relighting, persistent look profiles, cinematic review, and extension suggestions
 - **12 expert prompts** — topology best practices, real-world scale references, lighting principles, studio setup, character basemesh workflow, PBR material guide, auto-critique feedback loop, and more
 - **Visual feedback loop** — fast viewport screenshots via OpenGL render (~ms, not seconds) with auto-critique prompts that guide the LLM to check its own work
+- **Persistent look profiles** — compile deterministic lighting, World, atmosphere/weather, camera/render/color, and compositor variants as shallow linked Scenes; switch natively and retrieve the final Composite through MCP
+- **Cinematic review packets** — audit explicit shadow/reflection/compositor failures, retrieve the final Composite plus six diagnostic tiles, run an isolated one-image realism assessment, and request one strict evidence-pair critique before an approved profile revision
 - **Mesh quality analysis** — structured reports covering non-manifold edges, loose vertices, zero-area faces, duplicate vertices, and wire edges
 - **Extension suggestions** — proactively recommends Bool Tool, LoopTools, and Node Wrangler when a task would benefit from them (skips already-installed extensions)
 - **Sandboxed code execution** — `execute_blender_code` blocks dangerous imports (`os`, `subprocess`, `socket`, etc.) and dangerous builtins (`exec`, `eval`, `open`) while allowing safe Blender operations
 - **Render-aware** — automatically detects when Blender is rendering and queues commands. Recovers from stuck render guards via `load_post` handler and reset command
-- **Blender 4.2+ compatible** — ships as a Blender Extension; tested against Blender 5.1 with EEVEE identifier, Annotation API, sculpt stroke_method, SLIM UV unwrap, Raycast shader node, and EEVEE light path intensity controls
+- **Blender 4.2+ compatible** — ships as a Blender Extension; the look-profile compositor path is integration-tested on Blender 5.2 LTS and keeps explicit 4.2 legacy adapters
 - **Custom port** — configure the server port from the N-panel UI (default: 9876, range: 1024–65535)
 - **Zero telemetry** — no usage tracking, no analytics, no data collection. Everything runs locally on `127.0.0.1`
 - **Zero-dependency addon** — the Blender addon uses only Python stdlib + `bpy`. Nothing to pip install inside Blender
@@ -169,7 +171,7 @@ blend-ai includes 12 MCP prompts that guide the LLM toward professional-quality 
 ## Tool Domains
 
 <details>
-<summary><strong>All 170 tools across 25 modules</strong></summary>
+<summary><strong>All 179 tools across 27 modules</strong></summary>
 
 | Domain | Tools | Highlights |
 |--------|-------|-----------|
@@ -197,6 +199,8 @@ blend-ai includes 12 MCP prompts that guide the LLM toward professional-quality 
 | Viewport | 3 | Shading mode, overlays, focus on object |
 | Screenshot | 1 | Fast viewport capture (OpenGL) or full render, base64 output |
 | Spatial Relighting | 4 | Evaluated context, batch raycasts, managed light transactions, native Cycles images |
+| Look Profiles | 9 | Linked profile Scenes, deterministic manifests, native switching, state audit, async Composite batches, evidence-gated acceptance |
+| Cinematic Review | 1 | Blind REALISM, holistic reference comparison, and strict diagnostic critique/compare over final Composite evidence |
 | Code Exec | 1 | Sandboxed Python execution in Blender (dangerous imports blocked) |
 
 </details>
@@ -223,12 +227,35 @@ guarantees, verified Mac results, and the visual iteration loop, and
 [`docs/development-notes.md`](docs/development-notes.md) for the pinned base and
 local developer installation.
 
+### Persistent look profiles
+
+The look-profile layer adds `get_look_profile_context`, `upsert_look_profile`,
+`activate_look_profile`, `inspect_look_review_state`, `accept_look_profile`,
+`submit_look_render_batch`, `get_look_render_batch`,
+`cancel_look_render_batch`, `get_look_render_result`, and
+`review_look_render`. Complete looks compile
+to shallow linked Scenes: base geometry stays shared, while each profile owns a
+managed payload Collection, World, render/color state, and version-correct
+compositor. Render results are written from the authoritative Composite output;
+the MCP returns a bounded native image proxy derived from the completed full
+artifact with Scene/camera/profile/compositor provenance. Review-enabled
+results add one diagnostic sheet from the same render evaluation. The opt-in
+review tool can send only the unlabeled beauty for `REALISM`, compare that beauty
+holistically with two to four checksum-bound reference images in `REFERENCE`,
+or use the beauty plus diagnostics for causal critique. `REFERENCE` preserves
+the complete vision analysis, then uses a zero-image Gemini rewrite to separate
+look directions from useful material, geometry, composition, and artifact
+context that the relighting workflow must defer. Only the critic returns bounded
+profile-field actions. See
+[`docs/look-profiles.md`](docs/look-profiles.md) and the companion
+[`blender-look-profiles` skill](skills/blender-look-profiles/SKILL.md).
+
 <details>
 <summary><strong>How it works</strong></summary>
 
 - **MCP Server** (`src/blend_ai/`): Python process using the `mcp` SDK. Exposes tools, resources, and prompts over stdio. Validates all inputs before forwarding to Blender.
 - **Blender Addon** (`addon/`): Runs a TCP socket server inside Blender on a background thread. Commands are queued and executed on the main thread via `bpy.app.timers` to respect Blender's threading model.
-- **Render Guard**: Tracks render state via `bpy.app.handlers`. During renders, the server immediately returns a "busy" status. Automatically recovers from crashed renders via `load_post` handler. Can be force-reset via MCP command.
+- **Render Guard**: Tracks render state via `bpy.app.handlers`. Mutating commands receive a "busy" status during renders; explicit profile batch status/result/cancellation commands remain available. Automatically recovers from crashed renders via `load_post` handler and can be force-reset via MCP.
 - **Protocol**: Length-prefixed JSON messages over TCP with SO_KEEPALIVE for stale connection detection. Each message is a 4-byte big-endian length header followed by a UTF-8 JSON payload.
 
 </details>
@@ -238,8 +265,30 @@ local developer installation.
 <details>
 <summary><strong>Privacy</strong></summary>
 
-- **Zero telemetry** — blend-ai collects no usage data, sends no analytics, and makes no network requests beyond the local TCP connection to Blender.
-- **Fully local** — all communication stays on your machine. No cloud services, no external APIs, no phone-home behavior.
+- **Zero telemetry** — blend-ai collects no usage data and sends no analytics.
+  Normal Blender tools stay local. The optional `review_look_render` tool makes
+  explicit OpenRouter requests. `REALISM` uses two intentional calls: its vision
+  pass sends exactly one 1600px JPEG beauty proxy and a provenance-free
+  versioned prompt, then a fast text-only editor receives only the structured
+  feedback and filters it into lighting, shadows, lighting color/aesthetics,
+  atmosphere, optics, and post-processing. The rewrite receives no image,
+  diagnostics, filename, Scene/camera/profile metadata, engine, or synthetic
+  provenance. The vision versions retain distinct literal, evidence-balanced,
+  causal, and actionable-finishing strategies; material and geometry feedback
+  cannot survive into the final response.
+  `REFERENCE` also uses two intentional calls. Its vision pass sends one 1600px
+  JPEG beauty plus two to four locally loaded, checksum-bound photographic
+  references and a bounded brief/role packet. It judges lighting, value/color,
+  atmosphere/depth, camera/finish, materials/surfaces, geometry/assets, and
+  composition/staging only where assigned. The complete structured comparison
+  remains in `holistic_result`. A text-only `google/gemini-3.6-flash` rewrite
+  receives that feedback with zero images and emits `look_directions` plus
+  explicitly non-executable `deferred_context`. Local paths, source URLs,
+  filenames, AOVs, render-engine metadata, and synthetic provenance are not sent.
+  `CRITIQUE` and `COMPARE` each use one request with the selected beauty/diagnostic evidence pairs
+  plus their review prompts.
+- **Local by default** — Blender communication stays on your machine; only the
+  explicitly invoked cinematic-review tool calls its configured provider.
 - **Open source** — the entire codebase is auditable. What you see is what runs.
 
 </details>
@@ -269,6 +318,10 @@ local developer installation.
 - **No undo integration**: Operations appear in Blender's undo history individually but there's no MCP-level undo/redo or transaction grouping.
 - **Viewport capture requires a visible 3D viewport**: Headless Blender may not support viewport screenshots.
 - **No real-time feedback**: The MCP protocol is request/response. There's no streaming of viewport updates or render progress.
+- **Look batches are process-local and serialized**: Async profile jobs live in Blender memory, one render runs at a time, and a Blender restart loses the registry. Cancellation is cooperative, so an active frame may finish.
+- **Profile rain is static in v1**: The deterministic rain payload is Curve streak geometry, not animated precipitation, surface simulation, or shared-material wetness.
+- **Artist-light muting is profile-local and fail-closed**: `MUTE_NON_MANAGED` excludes shared light-only Collections, clones non-light members out of mixed Collections, and unlinks direct root lights only from the compiled Scene. It never toggles shared object visibility and refuses any membership it cannot isolate without changing the artist source Scene.
+- **Blender 4.2 profile compositing still needs a live gate**: Blender 5.2 is live- and integration-tested; the 4.2 legacy compositor adapter currently has focused compatibility tests rather than an equivalent live acceptance run.
 
 </details>
 

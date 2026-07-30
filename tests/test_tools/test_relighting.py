@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
@@ -29,6 +30,7 @@ from blend_ai.tools.relighting import (
     _capture_result,
     _decode_capture_image,
     _encode_capture_image,
+    _stage_capture_bytes,
     _send_relighting_command,
     _validate_identifier,
     _validate_safe_strings,
@@ -241,7 +243,7 @@ class TestInternalBoundaryValidation:
 
     def test_macos_helper_compiles_once_and_is_removed(self, tmp_path, monkeypatch):
         source = tmp_path / "capture.swift"
-        source.write_text("print(\"capture\")", encoding="utf-8")
+        source.write_text('print("capture")', encoding="utf-8")
 
         def fake_compile(arguments, **_kwargs):
             Path(arguments[-1]).write_bytes(b"compiled helper")
@@ -316,6 +318,12 @@ class TestGetLightingContext:
         assert params["collection_names"] == ["Shell", "Props"]
         assert params["camera_name"] == "Warehouse Camera"
         assert params["cache_mode"] == "REFRESH"
+
+    def test_preserves_trailing_camera_space(self, mock_conn):
+        get_lighting_context(camera_name="Camera ")
+
+        params = mock_conn.send_command.call_args.args[1]
+        assert params["camera_name"] == "Camera "
 
     def test_collections_scope_requires_names(self, mock_conn):
         with pytest.raises(ValidationError, match="collection_names"):
@@ -734,7 +742,10 @@ def _capture_side_effect(*, region_rect=None, mode="RGB"):
                 },
             }
         if command == "restore_cycles_viewport":
-            return {"status": "ok", "result": {"session_id": params["session_id"], "restored": True}}
+            return {
+                "status": "ok",
+                "result": {"session_id": params["session_id"], "restored": True},
+            }
         raise AssertionError(command)
 
     return respond
@@ -804,6 +815,52 @@ class TestCaptureCyclesViewport:
         assert result.structuredContent["output_height"] == 32
         assert result.structuredContent["jpeg_quality"] is None
         assert result.structuredContent["restored"] is True
+
+    @pytest.mark.asyncio
+    async def test_capture_atomically_stages_the_exact_returned_bytes(
+        self,
+        mock_conn,
+        tmp_path,
+    ):
+        mock_conn.send_command.side_effect = _capture_side_effect()
+        destination = tmp_path / "capture.png"
+        with patch("blend_ai.tools.relighting.asyncio.sleep", new=AsyncMock()):
+            result = await capture_cycles_viewport(
+                settle_seconds=0,
+                max_size=64,
+                format="PNG",
+                staging_path=str(destination),
+            )
+
+        returned = base64.b64decode(result.content[0].data)
+        assert destination.read_bytes() == returned
+        assert result.structuredContent["staging_path"] == str(destination)
+        assert result.structuredContent["staging_sha256"] == hashlib.sha256(returned).hexdigest()
+        assert not list(tmp_path.glob(".capture.png.*.tmp"))
+
+    @pytest.mark.asyncio
+    async def test_capture_staging_refuses_to_overwrite_before_prepare(
+        self,
+        mock_conn,
+        tmp_path,
+    ):
+        destination = tmp_path / "capture.png"
+        destination.write_bytes(b"existing evidence")
+
+        with pytest.raises(ValidationError, match="never overwrites"):
+            await capture_cycles_viewport(format="PNG", staging_path=str(destination))
+
+        assert destination.read_bytes() == b"existing evidence"
+        mock_conn.send_command.assert_not_called()
+
+    def test_atomic_stage_helper_does_not_publish_invalid_image(self, tmp_path):
+        destination = tmp_path / "capture.png"
+
+        with pytest.raises(RuntimeError, match="image validation"):
+            _stage_capture_bytes(b"not an image", destination, "PNG", 64, 64)
+
+        assert not destination.exists()
+        assert not list(tmp_path.glob(".capture.png.*.tmp"))
 
     @pytest.mark.asyncio
     async def test_transparent_source_can_encode_to_jpeg(self, mock_conn):
@@ -959,7 +1016,10 @@ class TestCaptureCyclesViewport:
                 return {"status": "ok", "result": {"session_id": "preview-123"}}
             if command == "capture_cycles_viewport_area":
                 return {"status": "error", "result": "window hidden"}
-            return {"status": "ok", "result": {"session_id": params["session_id"], "restored": True}}
+            return {
+                "status": "ok",
+                "result": {"session_id": params["session_id"], "restored": True},
+            }
 
         mock_conn.send_command.side_effect = respond
         with patch("blend_ai.tools.relighting.asyncio.sleep", new=AsyncMock()):
@@ -1136,7 +1196,10 @@ class TestCaptureCyclesViewport:
                 return {"status": "ok", "result": {"session_id": "preview-123"}}
             if command == "capture_cycles_viewport_area":
                 return {"status": "ok", "result": default}
-            return {"status": "ok", "result": {"session_id": params["session_id"], "restored": True}}
+            return {
+                "status": "ok",
+                "result": {"session_id": params["session_id"], "restored": True},
+            }
 
         mock_conn.send_command.side_effect = respond
         with patch("blend_ai.tools.relighting.asyncio.sleep", new=AsyncMock()):

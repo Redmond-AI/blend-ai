@@ -58,3 +58,23 @@ class TestCustomPort:
         """unregister() removes blendai_port from Scene."""
         # Should delete the property during unregister
         assert "del" in ui_source and "blendai_port" in ui_source
+
+
+class TestLookProfileSwitcher:
+    def test_reads_only_marked_profile_manifest(self, ui_source):
+        assert 'bpy.data.texts.get("AI_LOOK_PROFILES")' in ui_source
+        assert 'blend_ai_look_profile_manifest' in ui_source
+
+    def test_lists_profile_status_and_version(self, ui_source):
+        assert "display_name" in ui_source
+        assert "version" in ui_source
+        assert "revision" in ui_source
+        assert "status" in ui_source
+
+    def test_activation_requires_managed_scene_marker(self, ui_source):
+        assert 'blend_ai_look_managed' in ui_source
+        assert 'blend_ai_look_role' in ui_source
+
+    def test_activation_uses_shared_owned_profile_handler_without_saving(self, ui_source):
+        assert "look_profiles.handle_activate_look_profile" in ui_source
+        assert "save_mainfile" not in ui_source

@@ -45,6 +45,8 @@ from blend_ai.tools import (  # noqa: E402, F401
     code_exec,
     screenshot,
     relighting,
+    look_profiles,
+    look_review,
     booltool,
     mesh_editing,
     mesh_quality,

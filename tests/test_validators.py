@@ -64,8 +64,9 @@ class TestValidateObjectName:
         with pytest.raises(ValidationError, match="invalid characters"):
             validate_object_name("path/name")
 
-    def test_whitespace_stripping(self):
-        assert validate_object_name("  Cube  ") == "Cube"
+    def test_significant_whitespace_is_preserved(self):
+        assert validate_object_name("  Cube  ") == "  Cube  "
+        assert validate_object_name("Camera ") == "Camera "
 
     def test_only_whitespace_raises(self):
         # After stripping, empty string fails the pattern check or length

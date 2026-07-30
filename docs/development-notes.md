@@ -1,5 +1,20 @@
 # Development and installation notes
 
+## Optional cinematic-review credential
+
+The MCP server is launched through `scripts/run_blend_ai_with_secrets.sh`. The
+launcher resolves only the `op://` reference in
+`~/.codex/secret-env/blend-ai.env` into the child MCP process. It first uses the
+Keychain-backed 1Password service account and falls back to the current
+1Password CLI session. Blender receives no hosted-provider credential. A real
+OpenRouter request still requires an explicit `review_look_render` call; tests
+use a local deterministic adapter and never consume paid API usage. The native
+acceptance harness exercises the one-image vision plus zero-image text rewrite
+stages of `REALISM`; the candidate-plus-two-reference vision and zero-image
+Gemini rewrite stages of `REFERENCE`; two-image `CRITIQUE`; and four-image
+`COMPARE`. It preserves the native image and receipt artifacts, including the
+complete holistic reference result and the filtered decision handoff.
+
 ## Provenance
 
 - Public fork: `https://github.com/Redmond-AI/blend-ai`
@@ -8,10 +23,10 @@
 - Development branch: `codex/relighting-tools`
 - Pinned upstream base: `621ddc0dc8b379428e027c17ce817e1fc4d9cb36`
 
-The pinned commit is tagged `v1.2.2`, but `pyproject.toml`,
-`addon/blender_manifest.toml`, and the legacy `bl_info` metadata all report
-source version `1.2.1`. This fork records the discrepancy rather than silently
-changing upstream's package version.
+The pinned commit is tagged `v1.2.2`; this fork now reports version `1.4.0` in
+the Python package, Blender manifest, and legacy `bl_info` metadata to identify
+the cinematic-review, persistent look-profile, compositor, and batch-render
+feature release.
 
 The six-commit implementation and test tree was tested at fork commit
 `c356372d81115d739766b2f2e2d59c07d6ea8402`. The pinned SHA above is the

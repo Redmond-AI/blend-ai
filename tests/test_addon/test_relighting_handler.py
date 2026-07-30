@@ -339,6 +339,12 @@ def test_context_prioritizes_late_skylight_before_irrelevant_triangle_budget(
     module, fake_bpy, _spatial, _dispatcher = _load(monkeypatch)
     irrelevant = FakeID(name="Irrelevant_Highpoly", type="MESH")
     skylight = FakeID(name="North_Skylight", type="MESH")
+    fresh_irrelevant = FakeID(name="Irrelevant_Highpoly_Evaluated")
+    fresh_skylight = FakeID(name="North_Skylight_Evaluated")
+    irrelevant.evaluated_get = lambda _depsgraph: fresh_irrelevant
+    skylight.evaluated_get = lambda _depsgraph: fresh_skylight
+    sources = {irrelevant.name: irrelevant, skylight.name: skylight}
+    fake_bpy.data.objects.get = sources.get
     fake_bpy.context._depsgraph.object_instances = [
         FakeID(object=FakeID(original=irrelevant), persistent_id=(1,)),
         FakeID(object=FakeID(original=skylight), persistent_id=(2,)),
@@ -357,15 +363,15 @@ def test_context_prioritizes_late_skylight_before_irrelevant_triangle_budget(
         lambda _instance, _evaluated, source, *_args, **_kwargs: {
             "revision_scoped_id": source.name,
             "material_names": [],
-            "semantic_matches": (
-                ["skylight"] if "Skylight" in source.name else []
-            ),
+            "semantic_matches": (["skylight"] if "Skylight" in source.name else []),
         },
     )
     scan_order = []
 
-    def scan(_evaluated, source, _matrix, instance_id, budget, _terms):
+    def scan(evaluated, source, matrix, instance_id, budget, _terms):
         scan_order.append(source.name)
+        assert evaluated is (fresh_skylight if source is skylight else fresh_irrelevant)
+        assert isinstance(matrix, list)
         candidate = {
             "object_id": instance_id,
             "area": 1.0,
@@ -390,19 +396,97 @@ def test_context_prioritizes_late_skylight_before_irrelevant_triangle_budget(
     )
 
     assert scan_order == ["North_Skylight"]
-    assert result["candidates"]["openings"][0]["object_id"].startswith(
-        "North_Skylight"
+    assert result["candidates"]["openings"][0]["object_id"].startswith("North_Skylight")
+
+
+def test_context_retains_only_requested_rank_window_for_large_instance_stream(
+    monkeypatch,
+):
+    module, fake_bpy, _spatial, _dispatcher = _load(monkeypatch)
+    monkeypatch.setattr(module, "MIN_CONTEXT_SCANNED_INSTANCES", 10)
+    monkeypatch.setattr(module, "MAX_CONTEXT_SCANNED_INSTANCES", 25)
+    source = FakeID(name="RepeatedTree", type="MESH")
+    evaluated = FakeID(name="RepeatedTree", original=source, type="MESH")
+    fake_bpy.context._depsgraph.object_instances = [
+        FakeID(
+            object=evaluated,
+            matrix_world=[
+                [1.0, 0.0, 0.0, float(index)],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            persistent_id=(index + 1, 0, 0),
+        )
+        for index in range(10_000)
+    ]
+    monkeypatch.setattr(module, "_collection_paths", lambda _scene: {})
+    monkeypatch.setattr(module, "_scene_collection_membership", lambda *_args: {})
+    monkeypatch.setattr(module, "_instance_collections", lambda *_args: ([], []))
+    monkeypatch.setattr(
+        module,
+        "_bounds",
+        lambda _evaluated, matrix: {
+            "min": [matrix[0][3], 0.0, 0.0],
+            "max": [matrix[0][3] + 1.0, 1.0, 1.0],
+            "center": [matrix[0][3] + 0.5, 0.5, 0.5],
+            "size": [1.0, 1.0, 1.0],
+        },
     )
+    monkeypatch.setattr(module, "_is_visible", lambda *_args: (True, True))
+    monkeypatch.setattr(
+        module,
+        "_instance_record",
+        lambda instance, _evaluated, _source, matrix, *_args, **_kwargs: {
+            "revision_scoped_id": f"tree-{instance.persistent_id[0]:05d}",
+            "name": "RepeatedTree",
+            "source_name": "RepeatedTree",
+            "instance_source": None,
+            "matrix_world": matrix,
+            "material_names": [],
+            "semantic_matches": [],
+        },
+    )
+
+    result = module.handle_get_lighting_context(
+        {
+            "scope": "SCENE",
+            "detail": "BOUNDS",
+            "max_instances": 7,
+            "cache_mode": "REFRESH",
+        }
+    )
+
+    assert len(result["instances"]) == 7
+    assert result["page"] == {
+        "offset": 0,
+        "returned": 7,
+        "total": 25,
+        "complete": False,
+        "total_is_lower_bound": True,
+    }
+    assert result["truncated"] is True
+    assert result["surface_scan"]["evaluated_instances_scanned"] == 25
+    assert result["surface_scan"]["evaluated_instance_budget"] == 25
+    assert result["surface_scan"]["enumeration_truncated"] is True
+    assert any(
+        "context rankings, bounds, and candidates are partial" in warning
+        for warning in result["warnings"]
+    )
+    assert len(module._raycast_index_records) == 7
+    expected = [
+        f"tree-{instance.persistent_id[0]:05d}"
+        for instance in sorted(
+            fake_bpy.context._depsgraph.object_instances[:25],
+            key=lambda item: module._instance_identifier(item, source),
+        )[:7]
+    ]
+    assert [item["revision_scoped_id"] for item in result["instances"]] == expected
 
 
 def test_camera_projection_uses_exact_transformed_evaluated_corners(monkeypatch):
     module, _bpy, _spatial, _dispatcher = _load(monkeypatch)
-    local_corners = [
-        (x, y, z)
-        for x in (-5.0, 5.0)
-        for y in (-0.1, 0.1)
-        for z in (-0.1, 0.1)
-    ]
+    local_corners = [(x, y, z) for x in (-5.0, 5.0) for y in (-0.1, 0.1) for z in (-0.1, 0.1)]
     angle = math.radians(45.0)
     cosine = math.cos(angle)
     sine = math.sin(angle)
@@ -438,9 +522,7 @@ def test_camera_projection_uses_exact_transformed_evaluated_corners(monkeypatch)
         FakeID(data=FakeID(type="PERSP")),
         bounds,
     )
-    independently_projected = [
-        project(None, None, point) for point in bounds["evaluated_corners"]
-    ]
+    independently_projected = [project(None, None, point) for point in bounds["evaluated_corners"]]
     expected = [
         min(point.x for point in independently_projected),
         min(point.y for point in independently_projected),
@@ -535,9 +617,7 @@ def test_validate_rejects_managed_collection_linked_only_to_another_scene(
     fake_bpy.data.scenes = [active_scene, foreign_scene]
 
     with pytest.raises(ValueError, match="linked only to another scene"):
-        module.handle_apply_light_plan(
-            {"action": "VALIDATE", "plan_id": "night", "lights": []}
-        )
+        module.handle_apply_light_plan({"action": "VALIDATE", "plan_id": "night", "lights": []})
 
 
 def test_validate_rejects_managed_collection_shared_between_scenes(monkeypatch):
@@ -565,9 +645,7 @@ def test_validate_rejects_managed_collection_shared_between_scenes(monkeypatch):
     fake_bpy.data.scenes = [active_scene, foreign_scene]
 
     with pytest.raises(ValueError, match="shared with other scenes"):
-        module.handle_apply_light_plan(
-            {"action": "VALIDATE", "plan_id": "night", "lights": []}
-        )
+        module.handle_apply_light_plan({"action": "VALIDATE", "plan_id": "night", "lights": []})
 
 
 def test_plan_hard_limits_managed_lights(monkeypatch):
@@ -575,9 +653,7 @@ def test_plan_hard_limits_managed_lights(monkeypatch):
     lights = [_light_spec(id=f"red_{index}") for index in range(129)]
 
     with pytest.raises(ValueError, match="at most 128"):
-        module.handle_apply_light_plan(
-            {"action": "VALIDATE", "plan_id": "night", "lights": lights}
-        )
+        module.handle_apply_light_plan({"action": "VALIDATE", "plan_id": "night", "lights": lights})
 
 
 def test_managed_light_requires_exact_markers_on_object_and_data(monkeypatch):
@@ -941,7 +1017,7 @@ def test_batch_raycast_time_budget_returns_all_ids_as_unknown_partial(monkeypatc
     monkeypatch.setattr(
         module.time,
         "perf_counter",
-        MagicMock(side_effect=[0.0, 1.0, 1.1]),
+        MagicMock(side_effect=[0.0, 0.0, 0.0, 1.0, 1.1]),
     )
 
     result = module.handle_batch_raycast(
@@ -960,6 +1036,127 @@ def test_batch_raycast_time_budget_returns_all_ids_as_unknown_partial(monkeypatc
     assert all(ray["termination"] == "TIME_BUDGET" for ray in result["rays"])
     assert all(ray["clear_to_target"] is None for ray in result["rays"])
     ray_cast.assert_not_called()
+
+
+def test_batch_raycast_preprocessing_limit_is_fail_closed_and_not_cached(monkeypatch):
+    ray_cast = MagicMock()
+    scene = FakeID(
+        name="Scene",
+        frame_current=1,
+        objects=[],
+        ray_cast=ray_cast,
+    )
+    module, fake_bpy, _spatial, _dispatcher = _load(monkeypatch, scene=scene)
+    source = FakeID(name="DenseFoliage", name_full="DenseFoliage", type="MESH")
+    evaluated = FakeID(name="DenseFoliage", original=source, matrix_world=None)
+    fake_bpy.context._depsgraph.object_instances = [
+        FakeID(object=evaluated, persistent_id=(index,)) for index in range(2)
+    ]
+    monkeypatch.setattr(module, "MAX_RAYCAST_PREPROCESS_INSTANCES", 1)
+
+    result = module.handle_batch_raycast(
+        {
+            "rays": [
+                {"id": "moon_probe", "origin": [0, 0, 0], "target": [0, 0, 10]},
+                {"id": "rim_probe", "origin": [1, 0, 0], "target": [1, 0, 10]},
+            ]
+        }
+    )
+
+    assert result["complete"] is False
+    assert result["preprocessing"] == {
+        "complete": False,
+        "reason": "INSTANCE_LIMIT",
+        "instance_count_hint": 2,
+        "accelerated": False,
+    }
+    assert [ray["id"] for ray in result["rays"]] == ["moon_probe", "rim_probe"]
+    assert all(ray["termination"] == "PREPROCESSING_LIMIT" for ray in result["rays"])
+    assert module._raycast_index_complete is False
+    assert module._raycast_index_records == []
+    ray_cast.assert_not_called()
+
+
+def test_batch_raycast_deadline_covers_instance_preprocessing(monkeypatch):
+    class UnsizedInstances:
+        def __init__(self, values):
+            self.values = values
+
+        def __len__(self):
+            raise TypeError("depsgraph collection has no cheap length")
+
+        def __iter__(self):
+            return iter(self.values)
+
+    scene = FakeID(
+        name="Scene",
+        frame_current=1,
+        objects=[],
+        ray_cast=MagicMock(),
+    )
+    module, fake_bpy, _spatial, _dispatcher = _load(monkeypatch, scene=scene)
+    source = FakeID(name="Tree", name_full="Tree", type="MESH")
+    evaluated = FakeID(name="Tree", original=source, matrix_world=None)
+    fake_bpy.context._depsgraph.object_instances = UnsizedInstances(
+        [FakeID(object=evaluated, persistent_id=(index,)) for index in range(2)]
+    )
+    monkeypatch.setattr(
+        module.time,
+        "perf_counter",
+        MagicMock(side_effect=[0.0, 0.0, 0.0, 1.0, 1.1]),
+    )
+
+    result = module.handle_batch_raycast(
+        {
+            "rays": [{"id": "moon_probe", "origin": [0, 0, 0], "target": [0, 0, 10]}],
+            "time_budget_ms": 10,
+        }
+    )
+
+    assert result["complete"] is False
+    assert result["preprocessing"]["reason"] == "TIME_BUDGET"
+    assert result["rays"][0]["termination"] == "TIME_BUDGET"
+    assert module._raycast_index_complete is False
+    assert module._raycast_index_records == []
+    scene.ray_cast.assert_not_called()
+
+
+def test_dense_batch_raycast_skips_redundant_identity_prepass(monkeypatch):
+    class DenseInstances:
+        def __len__(self):
+            return 6_000
+
+        def __iter__(self):
+            raise AssertionError("dense depsgraph should be consumed only by the accelerator")
+
+    scene = FakeID(
+        name="Scene",
+        frame_current=1,
+        objects=[],
+        ray_cast=lambda *_args, **_kwargs: (
+            False,
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            -1,
+            None,
+            None,
+        ),
+    )
+    module, fake_bpy, _spatial, _dispatcher = _load(monkeypatch, scene=scene)
+    fake_bpy.context._depsgraph.object_instances = DenseInstances()
+    identity_prepass = MagicMock(side_effect=AssertionError("redundant identity prepass"))
+    accelerator = MagicMock(return_value=None)
+    monkeypatch.setattr(module, "_raycast_instance_records", identity_prepass)
+    monkeypatch.setattr(module, "_ensure_raycast_accel", accelerator)
+
+    result = module.handle_batch_raycast(
+        {"rays": [{"id": "probe", "origin": [0, 0, 0], "target": [0, 0, 1]}]}
+    )
+
+    assert result["complete"] is True
+    assert result["preprocessing"]["instance_count_hint"] == 6_000
+    identity_prepass.assert_not_called()
+    assert accelerator.call_args.kwargs["deadline"] > 0.0
 
 
 def test_target_raycast_uses_endpoint_tolerance(monkeypatch):
@@ -1263,12 +1460,7 @@ def test_collection_scope_includes_instancer_parent_collection_ancestry(monkeypa
         type="MESH",
         original=source,
         matrix_world=matrix,
-        bound_box=[
-            (x, y, z)
-            for x in (-1.0, 1.0)
-            for y in (-1.0, 1.0)
-            for z in (-1.0, 1.0)
-        ],
+        bound_box=[(x, y, z) for x in (-1.0, 1.0) for y in (-1.0, 1.0) for z in (-1.0, 1.0)],
     )
     instance = FakeID(
         object=evaluated,
@@ -1517,9 +1709,7 @@ def test_validate_rejects_unmanaged_display_name_collision(monkeypatch):
             {
                 "action": "VALIDATE",
                 "plan_id": "night",
-                "lights": [
-                    _point_spec("managed_artist_light", name="artist_light")
-                ],
+                "lights": [_point_spec("managed_artist_light", name="artist_light")],
             }
         )
 
@@ -1626,9 +1816,7 @@ def test_keep_policy_does_not_restore_unrelated_light_visibility(monkeypatch):
             ],
         }
     )
-    assert module._ledger[applied["transaction_id"]]["snapshot"][
-        "non_managed_visibility"
-    ] == []
+    assert module._ledger[applied["transaction_id"]]["snapshot"]["non_managed_visibility"] == []
 
     # This is an independent artist edit after the plan; KEEP rollback must
     # not overwrite it.
@@ -1823,9 +2011,7 @@ def test_exact_proposal_classifies_idempotent_light_as_unchanged(monkeypatch):
     module, _fake_bpy, _spatial, _dispatcher = _load(monkeypatch)
     _runtime, _scene = _managed_runtime(module)
     spec = _point_spec("red")
-    module.handle_apply_light_plan(
-        {"action": "APPLY", "plan_id": "night", "lights": [spec]}
-    )
+    module.handle_apply_light_plan({"action": "APPLY", "plan_id": "night", "lights": [spec]})
 
     validated = module.handle_apply_light_plan(
         {"action": "VALIDATE", "plan_id": "night", "lights": [spec]}
@@ -1833,6 +2019,49 @@ def test_exact_proposal_classifies_idempotent_light_as_unchanged(monkeypatch):
 
     assert validated["proposed_changes"]["update_ids"] == []
     assert validated["proposed_changes"]["unchanged_ids"] == ["red"]
+
+
+def test_patch_aims_target_quaternion_from_new_plan_location_not_stale_matrix(
+    monkeypatch,
+):
+    module, _fake_bpy, _spatial, _dispatcher = _load(monkeypatch)
+    _runtime, scene = _managed_runtime(module)
+    directions = []
+
+    class FakeVector(tuple):
+        def __new__(cls, value):
+            return tuple.__new__(cls, value)
+
+        def to_track_quat(self, track, up):
+            directions.append((tuple(self), track, up))
+            return (0.0, 1.0, 0.0, 0.0)
+
+    mathutils = ModuleType("mathutils")
+    mathutils.Vector = FakeVector
+    monkeypatch.setitem(sys.modules, "mathutils", mathutils)
+
+    initial = _light_spec(id="moon", name="moon")
+    module.handle_apply_light_plan({"action": "APPLY", "plan_id": "night", "lights": [initial]})
+    moon = scene.objects[0]
+    moon.matrix_world = FakeID(translation=(100.0, 100.0, 100.0))
+    patched = {
+        **initial,
+        "location_world": [1.0, 2.0, 3.0],
+        "target_point": [1.0, 2.0, 2.0],
+    }
+
+    module.handle_apply_light_plan(
+        {
+            "action": "APPLY",
+            "plan_id": "night",
+            "mode": "PATCH_MANAGED",
+            "lights": [patched],
+        }
+    )
+
+    assert directions[-1] == ((0.0, 0.0, -1.0), "-Z", "Y")
+    assert moon.rotation_mode == "QUATERNION"
+    assert moon.rotation_quaternion == (0.0, 1.0, 0.0, 0.0)
 
 
 def test_apply_freezes_target_object_before_removing_that_anchor(monkeypatch):
@@ -1872,9 +2101,7 @@ def test_apply_freezes_target_object_before_removing_that_anchor(monkeypatch):
 
     assert applied["removed"] == ["anchor"]
     assert [
-        obj[module.MANAGED_ID_PROP]
-        for obj in scene.objects
-        if module._is_managed_light(obj)
+        obj[module.MANAGED_ID_PROP] for obj in scene.objects if module._is_managed_light(obj)
     ] == ["follower"]
 
 
@@ -1886,9 +2113,7 @@ def test_unmarked_ledger_text_collision_is_never_adopted_or_cleared(monkeypatch)
     runtime.data.texts.append(artist_text)
 
     with pytest.raises(ValueError, match="not marked as the blend-ai relighting ledger"):
-        module.handle_apply_light_plan(
-            {"action": "VALIDATE", "plan_id": "night", "lights": []}
-        )
+        module.handle_apply_light_plan({"action": "VALIDATE", "plan_id": "night", "lights": []})
 
     assert artist_text.as_string() == "artist notes"
 
@@ -1902,9 +2127,7 @@ def test_ledger_write_failure_rolls_back_entire_apply(monkeypatch):
             raise OSError("disk full")
 
     runtime.data.texts.new = MagicMock(
-        side_effect=lambda name: (
-            runtime.data.texts.append(text := BrokenText(name)) or text
-        )
+        side_effect=lambda name: runtime.data.texts.append(text := BrokenText(name)) or text
     )
 
     with pytest.raises(RuntimeError, match="failed and was rolled back"):
@@ -2001,10 +2224,11 @@ def test_handler_rejects_spot_angles_below_blender_minimum(monkeypatch, spot_ang
         )
 
 
-@pytest.mark.parametrize("stage,failure_index", [(stage, index) for stage in ("create", "update", "remove") for index in (1, 2)])
-def test_fault_after_each_managed_mutation_restores_snapshot(
-    monkeypatch, stage, failure_index
-):
+@pytest.mark.parametrize(
+    "stage,failure_index",
+    [(stage, index) for stage in ("create", "update", "remove") for index in (1, 2)],
+)
+def test_fault_after_each_managed_mutation_restores_snapshot(monkeypatch, stage, failure_index):
     module, _fake_bpy, _spatial, _dispatcher = _load(monkeypatch)
     _runtime, scene = _managed_runtime(module)
     if stage != "create":

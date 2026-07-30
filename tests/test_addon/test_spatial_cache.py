@@ -192,6 +192,36 @@ def test_managed_edit_scope_covers_parent_collection_and_view_layer(monkeypatch)
     )
 
 
+@pytest.mark.parametrize("marker", ["blend_ai_managed", "blend_ai_look_managed"])
+def test_managed_profile_geometry_is_lighting_only_during_compile_scope(
+    monkeypatch, marker
+):
+    module, _bpy = _load(monkeypatch)
+
+    class ManagedMesh(dict):
+        bl_rna = SimpleNamespace(identifier="Mesh")
+        name_full = "Managed profile atmosphere"
+
+    mesh = ManagedMesh({marker: True})
+    update = SimpleNamespace(
+        id=mesh,
+        is_updated_geometry=True,
+        is_updated_transform=False,
+        is_updated_shading=False,
+    )
+    module.begin_managed_edit()
+    module.depsgraph_update_post(None, SimpleNamespace(updates=[update]))
+    module.end_managed_edit()
+
+    assert module.get_revisions() == {
+        "geometry_revision": 0,
+        "lighting_revision": 1,
+    }
+    assert module.get_recent_updates()[-1]["updates"][0][
+        "suppressed_by_managed_grace"
+    ] is True
+
+
 @pytest.mark.parametrize(
     "value",
     [

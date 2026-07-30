@@ -30,7 +30,8 @@ def validate_object_name(name: str) -> str:
     """Validate and sanitize a Blender object name."""
     if not name or not isinstance(name, str):
         raise ValidationError("Object name must be a non-empty string")
-    name = name.strip()
+    if not name.strip():
+        raise ValidationError("Object name must be a non-empty string")
     if len(name) > MAX_OBJECT_NAME_LENGTH:
         raise ValidationError(f"Object name exceeds maximum length of {MAX_OBJECT_NAME_LENGTH}")
     if not SAFE_NAME_PATTERN.match(name):

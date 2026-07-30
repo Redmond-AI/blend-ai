@@ -43,6 +43,10 @@ MAX_LEDGER_BYTES = 2 * 1024 * 1024
 
 MAX_INSTANCES = 5_000
 DEFAULT_MAX_INSTANCES = 2_000
+MIN_CONTEXT_SCANNED_INSTANCES = 4_096
+MAX_CONTEXT_SCANNED_INSTANCES = 50_000
+MAX_RAYCAST_PREPROCESS_INSTANCES = 50_000
+MAX_RAYCAST_ACCEL_TRIANGLES = 2_000_000
 MAX_SURFACE_TRIANGLES = 1_000_000
 DEFAULT_MAX_SURFACE_TRIANGLES = 200_000
 MAX_SURFACE_RESULTS = 64
@@ -62,12 +66,48 @@ _ledger_loaded = False
 _ledger_source_token: tuple[int, str] | None = None
 _raycast_index_key: tuple[int, str, str, int] | None = None
 _raycast_index_records: list[dict[str, Any]] = []
+_raycast_index_complete = False
 _raycast_accel_key: tuple[int, str, str, int] | None = None
 _raycast_accel: dict[str, Any] | None = None
+
+
+class _ReverseRank:
+    """Heap key that keeps the worst retained rank at the root."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: tuple[Any, ...]):
+        self.value = value
+
+    def __lt__(self, other: "_ReverseRank") -> bool:
+        return self.value > other.value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ReverseRank) and self.value == other.value
+
+
+def _retain_best_ranked(
+    heap: list[tuple[_ReverseRank, int, tuple[Any, ...], Any]],
+    *,
+    capacity: int,
+    rank: tuple[Any, ...],
+    sequence: int,
+    payload: Any,
+) -> None:
+    """Retain only the globally best ``capacity`` ranked payloads."""
+    if capacity <= 0:
+        return
+    entry = (_ReverseRank(rank), sequence, rank, payload)
+    if len(heap) < capacity:
+        heapq.heappush(heap, entry)
+    elif rank < heap[0][2]:
+        heapq.heapreplace(heap, entry)
+
 
 try:
     _persistent = bpy.app.handlers.persistent
 except (AttributeError, TypeError):
+
     def _persistent(callback: Any) -> Any:
         return callback
 
@@ -89,9 +129,10 @@ def _reset_ledger_state() -> None:
 
 
 def _reset_raycast_index() -> None:
-    global _raycast_index_key, _raycast_accel_key, _raycast_accel
+    global _raycast_index_key, _raycast_index_complete, _raycast_accel_key, _raycast_accel
     _raycast_index_key = None
     _raycast_index_records.clear()
+    _raycast_index_complete = False
     _raycast_accel_key = None
     _raycast_accel = None
 
@@ -280,14 +321,13 @@ def _bounds(obj: Any, matrix: Any) -> dict[str, list[float]] | None:
     }
 
 
-def _merge_bounds(current: dict[str, list[float]] | None, item: Any) -> dict[str, list[float]] | None:
+def _merge_bounds(
+    current: dict[str, list[float]] | None, item: Any
+) -> dict[str, list[float]] | None:
     if item is None:
         return current
     if current is None:
-        return {
-            key: _plain(item[key])
-            for key in ("min", "max", "center", "size")
-        }
+        return {key: _plain(item[key]) for key in ("min", "max", "center", "size")}
     minimum = [min(current["min"][axis], item["min"][axis]) for axis in range(3)]
     maximum = [max(current["max"][axis], item["max"][axis]) for axis in range(3)]
     return {
@@ -446,9 +486,7 @@ def _instance_collections(
                 sorted(
                     {
                         str(getattr(collection, "name", ""))
-                        for collection in _iter_values(
-                            getattr(candidate, "users_collection", None)
-                        )
+                        for collection in _iter_values(getattr(candidate, "users_collection", None))
                         if getattr(collection, "name", None)
                     }
                 )
@@ -511,15 +549,18 @@ def _camera_context(scene: Any, camera: Any, depsgraph: Any) -> dict[str, Any] |
     calc = getattr(camera, "calc_matrix_camera", None)
     if callable(calc):
         try:
-            projection_matrix = _matrix_rows(
-                calc(
-                    depsgraph,
-                    x=width,
-                    y=height,
-                    scale_x=pixel_aspect_x,
-                    scale_y=pixel_aspect_y,
+            projection_matrix = (
+                _matrix_rows(
+                    calc(
+                        depsgraph,
+                        x=width,
+                        y=height,
+                        scale_x=pixel_aspect_x,
+                        scale_y=pixel_aspect_y,
+                    )
                 )
-            ) or None
+                or None
+            )
         except Exception:
             projection_matrix = None
 
@@ -546,7 +587,11 @@ def _camera_context(scene: Any, camera: Any, depsgraph: Any) -> dict[str, Any] |
         "start": result["clip_start"],
         "end": result["clip_end"],
     }
-    for source, destination in (("angle", "field_of_view"), ("angle_x", "field_of_view_x"), ("angle_y", "field_of_view_y")):
+    for source, destination in (
+        ("angle", "field_of_view"),
+        ("angle_x", "field_of_view_x"),
+        ("angle_y", "field_of_view_y"),
+    ):
         value = getattr(data, source, None)
         if _is_number(value):
             result[destination] = float(value)
@@ -696,43 +741,66 @@ def _raycast_index_revision_key(geometry_revision: int) -> tuple[int, str, str, 
 def _store_raycast_index(
     geometry_revision: int,
     records: list[dict[str, Any]],
+    *,
+    complete: bool,
 ) -> None:
-    global _raycast_index_key, _raycast_index_records
+    global _raycast_index_key, _raycast_index_records, _raycast_index_complete
     # The index contains only strings, integers, and 4x4 float matrices.  It is
     # explicitly revision-bound and never retains evaluated RNA wrappers.
     _raycast_index_key = _raycast_index_revision_key(geometry_revision)
     _raycast_index_records = records
+    _raycast_index_complete = complete
+
+
+class _RaycastPreprocessingIncomplete(RuntimeError):
+    """Fail-closed signal for a bounded raycast preprocessing pass."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _raycast_instance_records(
     depsgraph: Any,
     geometry_revision: int,
+    *,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Build a command-local map from ray-cast object/matrix to context IDs."""
-    if _raycast_index_key == _raycast_index_revision_key(geometry_revision):
+    if (
+        _raycast_index_key == _raycast_index_revision_key(geometry_revision)
+        and _raycast_index_complete
+    ):
         return _raycast_index_records
     records: list[dict[str, Any]] = []
     # DepsgraphObjectInstance wrappers are iterator-scoped in Blender.  Turning
     # the collection into a list invalidates early wrappers before they are
     # read, producing ``StructRNA ... has been removed`` on large scenes.
     instances = getattr(depsgraph, "object_instances", ())
-    for instance in instances:
+    for scanned, instance in enumerate(instances, start=1):
+        if scanned > MAX_RAYCAST_PREPROCESS_INSTANCES:
+            raise _RaycastPreprocessingIncomplete(
+                "INSTANCE_LIMIT",
+                "Raycast preprocessing exceeded the evaluated-instance safety limit",
+            )
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise _RaycastPreprocessingIncomplete(
+                "TIME_BUDGET",
+                "Raycast preprocessing exhausted the command time budget",
+            )
         evaluated, source = _instance_source(instance)
         if evaluated is None or source is None:
             continue
-        matrix = getattr(instance, "matrix_world", None) or getattr(
-            evaluated, "matrix_world", None
-        )
+        matrix = getattr(instance, "matrix_world", None) or getattr(evaluated, "matrix_world", None)
         records.append(
             {
                 "id": _instance_identifier(instance, source),
                 "names": _object_match_names(evaluated) | _object_match_names(source),
-                "pointers": _object_pointer_tokens(evaluated)
-                | _object_pointer_tokens(source),
+                "pointers": _object_pointer_tokens(evaluated) | _object_pointer_tokens(source),
                 "matrix": _matrix_rows(matrix),
             }
         )
-    _store_raycast_index(geometry_revision, records)
+    _store_raycast_index(geometry_revision, records, complete=True)
     return records
 
 
@@ -758,7 +826,11 @@ def _source_accel_key(evaluated: Any, source: Any) -> str:
     return f"{getattr(source, 'name_full', getattr(source, 'name', 'Mesh'))}:{data_token}"
 
 
-def _mesh_bvh_record(evaluated: Any) -> dict[str, Any] | None:
+def _mesh_bvh_record(
+    evaluated: Any,
+    *,
+    triangle_budget: int | None = None,
+) -> dict[str, Any] | None:
     try:
         from mathutils.bvhtree import BVHTree
     except Exception:
@@ -775,6 +847,12 @@ def _mesh_bvh_record(evaluated: Any) -> dict[str, Any] | None:
         calculate = getattr(mesh, "calc_loop_triangles", None)
         if callable(calculate):
             calculate()
+        triangle_count = len(mesh.loop_triangles)
+        if triangle_budget is not None and triangle_count > triangle_budget:
+            raise _RaycastPreprocessingIncomplete(
+                "TRIANGLE_LIMIT",
+                "Raycast acceleration exceeded the evaluated-triangle safety limit",
+            )
         vertices = [tuple(float(value) for value in vertex.co) for vertex in mesh.vertices]
         triangles = [tuple(int(index) for index in item.vertices) for item in mesh.loop_triangles]
         if not vertices or not triangles:
@@ -796,6 +874,7 @@ def _mesh_bvh_record(evaluated: Any) -> dict[str, Any] | None:
             "bvh": BVHTree.FromPolygons(vertices, triangles, all_triangles=True),
             "polygon_indices": polygon_indices,
             "material_names": polygon_materials,
+            "triangle_count": triangle_count,
         }
     finally:
         clear = getattr(evaluated, "to_mesh_clear", None)
@@ -806,7 +885,9 @@ def _mesh_bvh_record(evaluated: Any) -> dict[str, Any] | None:
                 pass
 
 
-def _combined_aabb(records: list[dict[str, Any]], indices: list[int]) -> tuple[list[float], list[float]]:
+def _combined_aabb(
+    records: list[dict[str, Any]], indices: list[int]
+) -> tuple[list[float], list[float]]:
     minimum = [math.inf, math.inf, math.inf]
     maximum = [-math.inf, -math.inf, -math.inf]
     for index in indices:
@@ -853,7 +934,12 @@ def _build_aabb_tree(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
     return nodes, build(list(range(len(records))))
 
 
-def _ensure_raycast_accel(depsgraph: Any, geometry_revision: int) -> dict[str, Any] | None:
+def _ensure_raycast_accel(
+    depsgraph: Any,
+    geometry_revision: int,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any] | None:
     """Build a large-scene instance BVH without retaining evaluated RNA."""
     global _raycast_accel_key, _raycast_accel
     key = _raycast_index_revision_key(geometry_revision)
@@ -866,26 +952,40 @@ def _ensure_raycast_accel(depsgraph: Any, geometry_revision: int) -> dict[str, A
 
     source_records: dict[str, dict[str, Any]] = {}
     instances: list[dict[str, Any]] = []
-    for instance in getattr(depsgraph, "object_instances", ()):
+    triangle_count = 0
+    for scanned, instance in enumerate(getattr(depsgraph, "object_instances", ()), start=1):
+        if scanned > MAX_RAYCAST_PREPROCESS_INSTANCES:
+            raise _RaycastPreprocessingIncomplete(
+                "INSTANCE_LIMIT",
+                "Raycast acceleration exceeded the evaluated-instance safety limit",
+            )
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise _RaycastPreprocessingIncomplete(
+                "TIME_BUDGET",
+                "Raycast acceleration exhausted the command time budget",
+            )
         evaluated, source = _instance_source(instance)
-        if (
-            evaluated is None
-            or source is None
-            or str(getattr(source, "type", "")) != "MESH"
-        ):
+        if evaluated is None or source is None or str(getattr(source, "type", "")) != "MESH":
             continue
-        matrix = getattr(instance, "matrix_world", None) or getattr(
-            evaluated, "matrix_world", None
-        )
+        matrix = getattr(instance, "matrix_world", None) or getattr(evaluated, "matrix_world", None)
         bounds = _bounds(evaluated, matrix)
         if bounds is None:
             continue
         source_key = _source_accel_key(evaluated, source)
         if source_key not in source_records:
-            source_record = _mesh_bvh_record(evaluated)
+            source_record = _mesh_bvh_record(
+                evaluated,
+                triangle_budget=MAX_RAYCAST_ACCEL_TRIANGLES - triangle_count,
+            )
             if source_record is None:
                 continue
             source_records[source_key] = source_record
+            triangle_count += int(source_record["triangle_count"])
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise _RaycastPreprocessingIncomplete(
+                    "TIME_BUDGET",
+                    "Raycast acceleration exhausted the command time budget",
+                )
         matrix_value = Matrix(matrix)
         try:
             inverse = matrix_value.inverted()
@@ -899,16 +999,21 @@ def _ensure_raycast_accel(depsgraph: Any, geometry_revision: int) -> dict[str, A
                 "source_key": source_key,
                 "matrix": _matrix_rows(matrix_value),
                 "inverse": _matrix_rows(inverse),
-                "normal": [
-                    [float(normal[row][column]) for column in range(3)]
-                    for row in range(3)
-                ],
-                "bounds": {
-                    field: bounds[field] for field in ("min", "max", "center", "size")
-                },
+                "normal": [[float(normal[row][column]) for column in range(3)] for row in range(3)],
+                "bounds": {field: bounds[field] for field in ("min", "max", "center", "size")},
             }
         )
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise _RaycastPreprocessingIncomplete(
+            "TIME_BUDGET",
+            "Raycast acceleration exhausted the command time budget",
+        )
     nodes, root = _build_aabb_tree(instances)
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise _RaycastPreprocessingIncomplete(
+            "TIME_BUDGET",
+            "Raycast acceleration exhausted the command time budget",
+        )
     _raycast_accel = {
         "instances": instances,
         "sources": source_records,
@@ -960,9 +1065,7 @@ def _accel_candidates(
     candidates: list[tuple[float, int]] = []
     while pending:
         node = nodes[pending.pop()]
-        entry = _ray_aabb_entry(
-            origin, direction, distance, node["min"], node["max"]
-        )
+        entry = _ray_aabb_entry(origin, direction, distance, node["min"], node["max"])
         if entry is None:
             continue
         indices = node.get("indices")
@@ -1008,9 +1111,7 @@ def _accel_ray_cast(
         if not math.isfinite(scale) or scale <= 1e-15:
             continue
         local_direction = local_delta / scale
-        hit = source["bvh"].ray_cast(
-            local_origin, local_direction, distance * scale
-        )
+        hit = source["bvh"].ray_cast(local_origin, local_direction, distance * scale)
         location, normal, triangle_index, _local_distance = hit
         if location is None or normal is None or triangle_index is None:
             continue
@@ -1081,8 +1182,7 @@ def _raycast_object_id(
     candidates = [
         record
         for record in records
-        if hit_pointers & set(record["pointers"])
-        or hit_names & set(record["names"])
+        if hit_pointers & set(record["pointers"]) or hit_names & set(record["names"])
     ]
     if candidates:
         matrix_candidates: list[tuple[float, float, dict[str, Any]]] = []
@@ -1203,8 +1303,7 @@ def _instance_record(
     if projection is not None:
         result["camera"] = {
             "in_front": (
-                projection.get("depth_range") is not None
-                and projection["depth_range"][1] > 0.0
+                projection.get("depth_range") is not None and projection["depth_range"][1] > 0.0
             ),
             "in_frustum": projection.get("in_frustum"),
             "screen_rect": projection.get("screen_rect"),
@@ -1336,8 +1435,12 @@ def _triangle_candidates(
             except Exception:
                 pass
 
-    surface_result = [entry[2] for entry in sorted(surfaces, key=lambda item: item[0], reverse=True)]
-    opening_result = [entry[2] for entry in sorted(openings, key=lambda item: item[0], reverse=True)]
+    surface_result = [
+        entry[2] for entry in sorted(surfaces, key=lambda item: item[0], reverse=True)
+    ]
+    opening_result = [
+        entry[2] for entry in sorted(openings, key=lambda item: item[0], reverse=True)
+    ]
     return surface_result, opening_result, scanned, warnings
 
 
@@ -1410,7 +1513,9 @@ def _world_context(scene: Any) -> dict[str, Any] | None:
     for node in _iter_values(getattr(tree, "nodes", None)):
         if str(getattr(node, "type", "")) == "BACKGROUND":
             try:
-                result["background_color_rgb"] = _sequence(node.inputs["Color"].default_value, 4)[:3]
+                result["background_color_rgb"] = _sequence(node.inputs["Color"].default_value, 4)[
+                    :3
+                ]
                 result["strength"] = float(node.inputs["Strength"].default_value)
             except Exception:
                 pass
@@ -1467,7 +1572,9 @@ def _fit_context_payload(
     while _payload_size(result) > DEFAULT_PAYLOAD_TARGET_BYTES and (
         candidates["surfaces"] or candidates["openings"]
     ):
-        key = "surfaces" if len(candidates["surfaces"]) >= len(candidates["openings"]) else "openings"
+        key = (
+            "surfaces" if len(candidates["surfaces"]) >= len(candidates["openings"]) else "openings"
+        )
         candidates[key].pop()
         trimmed = True
     while _payload_size(result) > MAX_PAYLOAD_BYTES and len(result["instances"]) > 1:
@@ -1548,7 +1655,10 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
         collection_names = []
     if not isinstance(collection_names, list) or len(collection_names) > 64:
         raise ValueError("collection_names must be an array of at most 64 names")
-    collection_names = [_safe_name(value, f"collection_names[{index}]") for index, value in enumerate(collection_names)]
+    collection_names = [
+        _safe_name(value, f"collection_names[{index}]")
+        for index, value in enumerate(collection_names)
+    ]
     if any(len(value) > 63 for value in collection_names):
         raise ValueError("collection_names entries must be at most 63 characters")
     if scope == "COLLECTIONS" and not collection_names:
@@ -1557,8 +1667,7 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(semantic_terms, list) or len(semantic_terms) > 64:
         raise ValueError("semantic_terms must be an array of at most 64 strings")
     semantic_terms = [
-        _safe_name(value, f"semantic_terms[{index}]")
-        for index, value in enumerate(semantic_terms)
+        _safe_name(value, f"semantic_terms[{index}]") for index, value in enumerate(semantic_terms)
     ]
     if any(len(value) > 64 for value in semantic_terms):
         raise ValueError("semantic_terms entries must be at most 64 characters")
@@ -1602,15 +1711,9 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
             )
             render = getattr(scene, "render", None)
             cycles = getattr(scene, "cycles", None)
-            cached["scene"]["render_engine"] = str(
-                getattr(render, "engine", "")
-            )
-            cached["scene"]["cycles_device"] = (
-                str(getattr(cycles, "device", "")) or None
-            )
-            cached["scene"]["preview_samples"] = int(
-                getattr(cycles, "preview_samples", 0) or 0
-            )
+            cached["scene"]["render_engine"] = str(getattr(render, "engine", ""))
+            cached["scene"]["cycles_device"] = str(getattr(cycles, "device", "")) or None
+            cached["scene"]["preview_samples"] = int(getattr(cycles, "preview_samples", 0) or 0)
             world_summary = _world_context(scene)
             cached["scene"]["world_summary"] = world_summary
             cached["scene"]["world"] = world_summary
@@ -1630,7 +1733,12 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
     scene_membership = _scene_collection_membership(scene, paths)
     direct_collection_cache: dict[str, tuple[str, ...]] = {}
     requested_collections = set(collection_names)
-    ranked_records: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    # Retain only the requested rank window while still counting and bounding
+    # the complete eligible stream.  Geometry-Nodes and particle scenes can
+    # expose millions of evaluated instances; retaining every JSON-ready
+    # record used to exhaust memory before pagination was applied.
+    ranked_capacity = offset + max_instances
+    ranked_heap: list[tuple[_ReverseRank, int, tuple[Any, ...], dict[str, Any]]] = []
     scene_bounds = None
     collection_bounds: dict[str, dict[str, list[float]] | None] = {
         name: None for name in paths if scope != "COLLECTIONS" or name in requested_collections
@@ -1640,13 +1748,40 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
     eligible_count = 0
     surface_heaps: list[tuple[float, int, dict[str, Any]]] = []
     opening_heaps: list[tuple[float, int, dict[str, Any]]] = []
-    candidate_scan_queue: list[
-        tuple[tuple[Any, ...], Any, Any, Any, str]
+    # Never retain DepsgraphObjectInstance, evaluated Object, or RNA-backed
+    # Matrix wrappers after advancing ``depsgraph.object_instances``.  Blender
+    # invalidates those iterator-scoped values on large scenes and accessing a
+    # stale matrix can abort the host process (not merely raise Python).  The
+    # deferred, rank-ordered mesh scan therefore keeps only stable identifiers
+    # and a plain 4x4 float snapshot, then reacquires a fresh evaluated Object.
+    candidate_capacity = (
+        min(MAX_INSTANCES, max(max_instances, max_surface_triangles))
+        if detail == "CANDIDATES" and max_surface_triangles > 0
+        else 0
+    )
+    candidate_scan_heap: list[
+        tuple[
+            _ReverseRank,
+            int,
+            tuple[Any, ...],
+            tuple[str, list[list[float]], str],
+        ]
     ] = []
+    context_scan_capacity = min(
+        MAX_CONTEXT_SCANNED_INSTANCES,
+        max(
+            MIN_CONTEXT_SCANNED_INSTANCES,
+            ranked_capacity * 8,
+            candidate_capacity * 8,
+        ),
+    )
+    evaluated_instances_scanned = 0
+    enumeration_truncated = False
+    candidate_instance_count = 0
     surface_scanned = 0
     mesh_instances_scanned = 0
     sequence = 0
-    raycast_index_records: list[dict[str, Any]] = []
+    ranking_sequence = 0
 
     try:
         instances = getattr(depsgraph, "object_instances", ())
@@ -1654,30 +1789,22 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"Unable to enumerate evaluated scene instances: {exc}") from exc
 
     for instance in instances:
+        if evaluated_instances_scanned >= context_scan_capacity:
+            enumeration_truncated = True
+            break
+        evaluated_instances_scanned += 1
         evaluated, source = _instance_source(instance)
         if evaluated is None or source is None:
             continue
         matrix = getattr(instance, "matrix_world", None) or getattr(evaluated, "matrix_world", None)
         instance_id = _instance_identifier(instance, source)
-        raycast_index_records.append(
-            {
-                "id": instance_id,
-                "names": sorted(
-                    _object_match_names(evaluated) | _object_match_names(source)
-                ),
-                "pointers": [],
-                "matrix": _matrix_rows(matrix),
-            }
-        )
         item_bounds = _bounds(evaluated, matrix)
-        collection_names_for_instance, _collection_paths_for_instance = (
-            _instance_collections(
-                instance,
-                source,
-                paths,
-                scene_membership,
-                direct_collection_cache,
-            )
+        collection_names_for_instance, _collection_paths_for_instance = _instance_collections(
+            instance,
+            source,
+            paths,
+            scene_membership,
+            direct_collection_cache,
         )
         collection_set = set(collection_names_for_instance)
         visible_viewport, visible_render = _is_visible(source, view_layer)
@@ -1695,10 +1822,7 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
                 collection_counts[collection_name] += 1
         projection = _project_bounds(scene, camera, item_bounds) if scope == "CAMERA" else None
         public_bounds = (
-            {
-                key: item_bounds[key]
-                for key in ("min", "max", "center", "size")
-            }
+            {key: item_bounds[key] for key in ("min", "max", "center", "size")}
             if item_bounds is not None
             else None
         )
@@ -1723,21 +1847,22 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
             -float(projection.get("projected_area") or 0.0) if projection else 0.0,
             instance_id,
         )
-        ranked_records.append((rank, record))
+        ranking_sequence += 1
+        _retain_best_ranked(
+            ranked_heap,
+            capacity=ranked_capacity,
+            rank=rank,
+            sequence=ranking_sequence,
+            payload=record,
+        )
 
         if detail == "CANDIDATES" and str(getattr(source, "type", "")) == "MESH":
             semantic_text = " ".join(
                 [str(getattr(source, "name", "")), *record["material_names"]]
             ).lower()
-            opening_semantic = any(
-                word in semantic_text for word in OPENING_SEMANTIC_WORDS
-            )
+            opening_semantic = any(word in semantic_text for word in OPENING_SEMANTIC_WORDS)
             in_frustum = bool(projection and projection.get("in_frustum"))
-            projected_area = (
-                float(projection.get("projected_area") or 0.0)
-                if projection
-                else 0.0
-            )
+            projected_area = float(projection.get("projected_area") or 0.0) if projection else 0.0
             size = item_bounds.get("size", [0.0, 0.0, 0.0]) if item_bounds else []
             bounds_size = sum(abs(float(value)) for value in size)
             scan_rank = (
@@ -1748,11 +1873,50 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
                 -bounds_size,
                 instance_id,
             )
-            candidate_scan_queue.append(
-                (scan_rank, evaluated, source, matrix, instance_id)
+            candidate_instance_count += 1
+            _retain_best_ranked(
+                candidate_scan_heap,
+                capacity=candidate_capacity,
+                rank=scan_rank,
+                sequence=ranking_sequence,
+                payload=(
+                    str(getattr(source, "name", "")),
+                    _matrix_rows(matrix),
+                    instance_id,
+                ),
             )
 
-    _store_raycast_index(revisions["geometry_revision"], raycast_index_records)
+    ranked_records = sorted(
+        ((entry[2], entry[3]) for entry in ranked_heap),
+        key=lambda item: item[0],
+    )
+    records = [item[1] for item in ranked_records[offset : offset + max_instances]]
+    raycast_index_records = [
+        {
+            "id": str(record.get("revision_scoped_id", "")),
+            "names": sorted(
+                {
+                    str(value)
+                    for value in (
+                        record.get("name"),
+                        record.get("source_name"),
+                        record.get("instance_source"),
+                    )
+                    if value
+                }
+            ),
+            "pointers": [],
+            "matrix": record.get("matrix_world") or [],
+        }
+        for record in records
+    ]
+    # Context pages are intentionally bounded and filtered, so they are useful
+    # for best-effort hit identity but never a complete raycast index.
+    _store_raycast_index(
+        revisions["geometry_revision"],
+        raycast_index_records,
+        complete=False,
+    )
     acceleration_build_ms = 0.0
     if len(raycast_index_records) > 5_000:
         acceleration_started = time.perf_counter()
@@ -1763,10 +1927,38 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
     # instance records first prevents an unrelated high-poly mesh encountered
     # early in depsgraph order from exhausting the triangle budget before a
     # later skylight/window candidate can be inspected.
-    candidate_scan_queue.sort(key=lambda item: item[0])
-    for _rank, evaluated, source, matrix, instance_id in candidate_scan_queue:
+    candidate_scan_queue = sorted(
+        ((entry[2], *entry[3]) for entry in candidate_scan_heap),
+        key=lambda item: item[0],
+    )
+    if candidate_instance_count > len(candidate_scan_queue):
+        warnings.append(
+            "Candidate instance ranking was bounded to "
+            f"{len(candidate_scan_queue)} of {candidate_instance_count} meshes; "
+            "lower-ranked candidate meshes were omitted"
+        )
+    if enumeration_truncated:
+        warnings.append(
+            "Evaluated instance scan was bounded to "
+            f"{evaluated_instances_scanned} instances; context rankings, bounds, "
+            "and candidates are partial"
+        )
+    for _rank, source_name, matrix, instance_id in candidate_scan_queue:
         if surface_scanned >= max_surface_triangles:
             break
+        source = _lookup(getattr(bpy.data, "objects", None), source_name)
+        if source is None:
+            warnings.append(f"Surface scan skipped for unavailable source object '{source_name}'")
+            continue
+        evaluated_get = getattr(source, "evaluated_get", None)
+        try:
+            evaluated = evaluated_get(depsgraph) if callable(evaluated_get) else source
+        except Exception as exc:
+            warnings.append(
+                f"Surface scan skipped for '{source_name}': unable to reacquire "
+                f"evaluated object ({exc})"
+            )
+            continue
         remaining = max_surface_triangles - surface_scanned
         surfaces, openings, scanned, scan_warnings = _triangle_candidates(
             evaluated, source, matrix, instance_id, remaining, semantic_terms
@@ -1786,23 +1978,23 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
             if len(opening_heaps) > MAX_SURFACE_RESULTS:
                 heapq.heappop(opening_heaps)
 
-    ranked_records.sort(key=lambda item: item[0])
-    records = [item[1] for item in ranked_records[offset : offset + max_instances]]
     next_offset = offset + len(records)
     complete = next_offset >= eligible_count
-    next_cursor = None if complete else _encode_cursor(
-        next_offset, revisions["geometry_revision"], signature
+    next_cursor = (
+        None if complete else _encode_cursor(next_offset, revisions["geometry_revision"], signature)
     )
     if surface_scanned >= max_surface_triangles and max_surface_triangles:
         warnings.append("Surface scan reached max_surface_triangles; candidates are partial")
-    if scope == "CAMERA" and camera and str(getattr(getattr(camera, "data", None), "type", "")) == "PANO":
+    if (
+        scope == "CAMERA"
+        and camera
+        and str(getattr(getattr(camera, "data", None), "type", "")) == "PANO"
+    ):
         warnings.append("Panoramic projection is unsupported; view-layer objects were retained")
 
     camera_payload = _camera_context(scene, camera, depsgraph)
     if camera_payload is not None:
-        camera_payload["projection_supported"] = camera_payload.pop(
-            "frustum_test_supported", True
-        )
+        camera_payload["projection_supported"] = camera_payload.pop("frustum_test_supported", True)
     surfaces_result = [
         entry[2] for entry in sorted(surface_heaps, key=lambda item: item[0], reverse=True)
     ]
@@ -1813,9 +2005,7 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
         {
             "id": name,
             "name": name,
-            "parent_id": (
-                paths[name][-2] if len(paths.get(name, [])) > 1 else None
-            ),
+            "parent_id": (paths[name][-2] if len(paths.get(name, [])) > 1 else None),
             "path": paths.get(name, [name]),
             "bounds": collection_bounds.get(name),
             "object_count": collection_counts.get(name, 0),
@@ -1840,9 +2030,7 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
             "render_engine": str(getattr(render, "engine", "")),
             "cycles_device": str(getattr(cycles, "device", "")) or None,
             "preview_samples": int(getattr(cycles, "preview_samples", 0) or 0),
-            "exposure": float(
-                getattr(getattr(scene, "view_settings", None), "exposure", 0.0)
-            ),
+            "exposure": float(getattr(getattr(scene, "view_settings", None), "exposure", 0.0)),
             **revisions,
             "scene_revision": scene_revision,
             "scope": scope,
@@ -1865,6 +2053,9 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
         # Scan accounting is small and important for judging partial candidate
         # coverage in a complicated production scene.
         "surface_scan": {
+            "evaluated_instances_scanned": evaluated_instances_scanned,
+            "evaluated_instance_budget": context_scan_capacity,
+            "enumeration_truncated": enumeration_truncated,
             "triangles_scanned": surface_scanned,
             "triangle_budget": max_surface_triangles,
             "mesh_instances_scanned": mesh_instances_scanned,
@@ -1882,6 +2073,10 @@ def handle_get_lighting_context(params: dict[str, Any]) -> dict[str, Any]:
         geometry_revision=revisions["geometry_revision"],
         signature=signature,
     )
+    if enumeration_truncated:
+        result["truncated"] = True
+        result["page"]["complete"] = False
+        result["page"]["total_is_lower_bound"] = True
     result = _plain(result)
     spatial_cache.put_cached(cache_key, result)
     return result
@@ -1923,7 +2118,9 @@ def _blender_vector(value: list[float]) -> Any:
 def _ray_definition(value: Any, index: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"rays[{index}] must be an object")
-    _reject_unknown(value, {"id", "origin", "target", "direction", "max_distance"}, f"rays[{index}]")
+    _reject_unknown(
+        value, {"id", "origin", "target", "direction", "max_distance"}, f"rays[{index}]"
+    )
     ray_id = _safe_name(value.get("id"), f"rays[{index}].id", identifier=True)
     origin = _vec3(value.get("origin"), f"rays[{index}].origin")
     has_target = value.get("target") is not None
@@ -1944,7 +2141,9 @@ def _ray_definition(value: Any, index: int) -> dict[str, Any]:
             "target": target,
             "targeted": True,
         }
-    direction, _ = _normalize(_vec3(value["direction"], f"rays[{index}].direction"), f"rays[{index}].direction")
+    direction, _ = _normalize(
+        _vec3(value["direction"], f"rays[{index}].direction"), f"rays[{index}].direction"
+    )
     max_distance = _number(
         value.get("max_distance", 1_000_000.0),
         f"rays[{index}].max_distance",
@@ -1984,7 +2183,9 @@ def _call_ray_cast(
             distance=distance,
         )
     except TypeError:
-        return scene.ray_cast(depsgraph, _blender_vector(origin), _blender_vector(direction), distance)
+        return scene.ray_cast(
+            depsgraph, _blender_vector(origin), _blender_vector(direction), distance
+        )
 
 
 def _ray_advance_epsilon(
@@ -2028,9 +2229,7 @@ def handle_batch_raycast(params: dict[str, Any]) -> dict[str, Any]:
     revisions = spatial_cache.get_revisions()
     expected = params.get("expected_geometry_revision")
     if expected is not None:
-        expected = _integer(
-            expected, "expected_geometry_revision", minimum=0, maximum=2**63 - 1
-        )
+        expected = _integer(expected, "expected_geometry_revision", minimum=0, maximum=2**63 - 1)
         if expected != revisions["geometry_revision"]:
             raise ValueError(
                 f"Stale geometry revision: expected {expected}, current {revisions['geometry_revision']}"
@@ -2048,30 +2247,96 @@ def handle_batch_raycast(params: dict[str, Any]) -> dict[str, Any]:
     include_ignored = params.get("include_ignored_hits", True)
     _bool(include_ignored, "include_ignored_hits")
     object_patterns = _patterns(params.get("ignore_object_patterns"), "ignore_object_patterns")
-    material_patterns = _patterns(params.get("ignore_material_patterns"), "ignore_material_patterns")
+    material_patterns = _patterns(
+        params.get("ignore_material_patterns"), "ignore_material_patterns"
+    )
     time_budget_ms = _integer(
         params.get("time_budget_ms", 2000), "time_budget_ms", minimum=10, maximum=5000
     )
-    scene = bpy.context.scene
-    unit_scale = float(
-        getattr(getattr(scene, "unit_settings", None), "scale_length", 1.0) or 1.0
-    )
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    instance_records = _raycast_instance_records(
-        depsgraph, revisions["geometry_revision"]
-    )
-    acceleration = (
-        _raycast_accel
-        if _raycast_accel_key
-        == _raycast_index_revision_key(revisions["geometry_revision"])
-        else None
-    )
-    if acceleration is None and len(instance_records) > 5_000:
-        acceleration = _ensure_raycast_accel(
-            depsgraph, revisions["geometry_revision"]
-        )
     started = time.perf_counter()
     deadline = started + time_budget_ms / 1000.0
+    scene = bpy.context.scene
+    unit_scale = float(getattr(getattr(scene, "unit_settings", None), "scale_length", 1.0) or 1.0)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    acceleration = (
+        _raycast_accel
+        if _raycast_accel_key == _raycast_index_revision_key(revisions["geometry_revision"])
+        else None
+    )
+    instance_records: list[dict[str, Any]] = []
+    instance_count_hint: int | None = None
+    preprocessing_started = time.perf_counter()
+    try:
+        if acceleration is None:
+            try:
+                instance_count_hint = len(getattr(depsgraph, "object_instances", ()))
+            except Exception:
+                instance_count_hint = None
+            if (
+                instance_count_hint is not None
+                and instance_count_hint > MAX_RAYCAST_PREPROCESS_INSTANCES
+            ):
+                raise _RaycastPreprocessingIncomplete(
+                    "INSTANCE_LIMIT",
+                    "Raycast preprocessing exceeded the evaluated-instance safety limit",
+                )
+            if instance_count_hint is not None and instance_count_hint > 5_000:
+                # Dense scenes go straight to acceleration.  The accelerated
+                # hit proxy already carries the stable instance ID, avoiding a
+                # redundant full depsgraph enumeration just for identity.
+                acceleration = _ensure_raycast_accel(
+                    depsgraph,
+                    revisions["geometry_revision"],
+                    deadline=deadline,
+                )
+            else:
+                instance_records = _raycast_instance_records(
+                    depsgraph,
+                    revisions["geometry_revision"],
+                    deadline=deadline,
+                )
+                if len(instance_records) > 5_000:
+                    acceleration = _ensure_raycast_accel(
+                        depsgraph,
+                        revisions["geometry_revision"],
+                        deadline=deadline,
+                    )
+        preprocessing_ms = (time.perf_counter() - preprocessing_started) * 1000.0
+    except _RaycastPreprocessingIncomplete as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        termination = "TIME_BUDGET" if exc.reason == "TIME_BUDGET" else "PREPROCESSING_LIMIT"
+        output = [
+            {
+                "id": ray["id"],
+                "complete": False,
+                "clear_to_target": None,
+                "termination": termination,
+                "hits": [],
+                "accepted_hits": 0,
+                "ignored_encounters": 0,
+                "requested_distance": ray["distance"],
+                "distance_requested": ray["distance"],
+                "endpoint_tolerance": ray["endpoint_tolerance"],
+                "distance_travelled": 0.0,
+            }
+            for ray in rays
+        ]
+        return _plain(
+            {
+                **revisions,
+                "scene_revision": spatial_cache.make_scene_revision(scene),
+                "rays": output,
+                "complete": False,
+                "elapsed_ms": elapsed_ms,
+                "preprocessing": {
+                    "complete": False,
+                    "reason": exc.reason,
+                    "instance_count_hint": instance_count_hint,
+                    "accelerated": False,
+                },
+                "warnings": [str(exc)],
+            }
+        )
     output: list[dict[str, Any]] = []
     all_complete = True
 
@@ -2128,7 +2393,9 @@ def handle_batch_raycast(params: dict[str, Any]) -> dict[str, Any]:
             normal_value = _sequence(normal, 3)
             if not location_value or not normal_value:
                 raise RuntimeError("Blender ray_cast returned non-finite hit coordinates")
-            step = math.sqrt(sum(component * component for component in _sub(location_value, origin)))
+            step = math.sqrt(
+                sum(component * component for component in _sub(location_value, origin))
+            )
             if not math.isfinite(step):
                 raise RuntimeError("Blender ray_cast returned a non-finite distance")
             cumulative = travelled + step
@@ -2192,11 +2459,7 @@ def handle_batch_raycast(params: dict[str, Any]) -> dict[str, Any]:
                 "id": ray["id"],
                 "complete": complete,
                 "clear_to_target": (
-                    (
-                        termination == "TARGET_REACHED"
-                        if complete
-                        else None
-                    )
+                    (termination == "TARGET_REACHED" if complete else None)
                     if ray["targeted"]
                     else None
                 ),
@@ -2240,7 +2503,16 @@ def handle_batch_raycast(params: dict[str, Any]) -> dict[str, Any]:
             "rays": output,
             "complete": all_complete,
             "elapsed_ms": elapsed_ms,
-            "warnings": [] if all_complete else ["Ray query returned partial results; retry unfinished IDs"],
+            "preprocessing": {
+                "complete": True,
+                "reason": None,
+                "instance_count_hint": instance_count_hint,
+                "accelerated": acceleration is not None,
+                "elapsed_ms": preprocessing_ms,
+            },
+            "warnings": []
+            if all_complete
+            else ["Ray query returned partial results; retry unfinished IDs"],
         }
     )
 
@@ -2321,7 +2593,9 @@ def _resolve_target(value: str) -> Any:
     return target
 
 
-def _validate_light_spec(value: Any, index: int, strict: bool, warnings: list[str]) -> dict[str, Any]:
+def _validate_light_spec(
+    value: Any, index: int, strict: bool, warnings: list[str]
+) -> dict[str, Any]:
     field = f"lights[{index}]"
     if not isinstance(value, dict):
         raise ValueError(f"{field} must be an object")
@@ -2348,7 +2622,9 @@ def _validate_light_spec(value: Any, index: int, strict: bool, warnings: list[st
     if target_point_resolved is not None:
         _normalize(_sub(target_point_resolved, location), f"{field} target direction")
     if light_type == "POINT" and target_point_resolved is not None:
-        _warn_or_raise(strict, warnings, f"{field}: POINT lights do not support aiming; target was ignored")
+        _warn_or_raise(
+            strict, warnings, f"{field}: POINT lights do not support aiming; target was ignored"
+        )
         target_point = None
         target_object = None
 
@@ -2386,7 +2662,9 @@ def _validate_light_spec(value: Any, index: int, strict: bool, warnings: list[st
             )
     if value.get("sun_angle_degrees") is not None:
         if light_type != "SUN":
-            _warn_or_raise(strict, warnings, f"{field}.sun_angle_degrees only applies to SUN lights")
+            _warn_or_raise(
+                strict, warnings, f"{field}.sun_angle_degrees only applies to SUN lights"
+            )
         else:
             normalized["sun_angle_degrees"] = _number(
                 value["sun_angle_degrees"],
@@ -2399,7 +2677,9 @@ def _validate_light_spec(value: Any, index: int, strict: bool, warnings: list[st
         if shape not in {"SQUARE", "RECTANGLE", "DISK", "ELLIPSE"}:
             raise ValueError(f"{field}.area_shape must be SQUARE, RECTANGLE, DISK, or ELLIPSE")
         normalized["area_shape"] = shape
-        normalized["size"] = _number(value.get("size", 1.0), f"{field}.size", minimum=1e-6, maximum=1_000_000.0)
+        normalized["size"] = _number(
+            value.get("size", 1.0), f"{field}.size", minimum=1e-6, maximum=1_000_000.0
+        )
         if shape in {"RECTANGLE", "ELLIPSE"}:
             normalized["size_y"] = _number(
                 value.get("size_y", normalized["size"]),
@@ -2459,7 +2739,9 @@ def _validate_scene_overrides(value: Any) -> dict[str, Any]:
             raise ValueError("scene_overrides.world.mode must be KEEP or MANAGED_SOLID")
         world = {
             "mode": mode,
-            "color_rgb": _color(world_value.get("color_rgb", [0.0, 0.0, 0.0]), "scene_overrides.world.color_rgb"),
+            "color_rgb": _color(
+                world_value.get("color_rgb", [0.0, 0.0, 0.0]), "scene_overrides.world.color_rgb"
+            ),
             "strength": _number(
                 world_value.get("strength", 0.0),
                 "scene_overrides.world.strength",
@@ -2585,7 +2867,10 @@ def _preflight_managed_state(
                 )
             data = getattr(obj, "data", None)
             managed_targets.update({_rna_identity(obj), _rna_identity(data)})
-            if getattr(obj, "library", None) is not None or getattr(data, "library", None) is not None:
+            if (
+                getattr(obj, "library", None) is not None
+                or getattr(data, "library", None) is not None
+            ):
                 raise ValueError(f"Managed light '{getattr(obj, 'name', '')}' is linked/read-only")
             if strict and (
                 _iter_values(getattr(obj, "constraints", None))
@@ -2614,9 +2899,13 @@ def _preflight_managed_state(
                     "would not survive removal or type replacement"
                 )
             light_linking = getattr(obj, "light_linking", None)
-            if strict and light_linking is not None and (
-                getattr(light_linking, "receiver_collection", None) is not None
-                or getattr(light_linking, "blocker_collection", None) is not None
+            if (
+                strict
+                and light_linking is not None
+                and (
+                    getattr(light_linking, "receiver_collection", None) is not None
+                    or getattr(light_linking, "blocker_collection", None) is not None
+                )
             ):
                 raise ValueError(
                     f"Managed light '{getattr(obj, 'name', '')}' has unsupported light linking"
@@ -2624,10 +2913,7 @@ def _preflight_managed_state(
             scale = _sequence(getattr(obj, "scale", (1.0, 1.0, 1.0)), 3)
             if strict and (
                 len(scale) != 3
-                or any(
-                    not math.isclose(value, 1.0, rel_tol=0.0, abs_tol=1e-9)
-                    for value in scale
-                )
+                or any(not math.isclose(value, 1.0, rel_tol=0.0, abs_tol=1e-9) for value in scale)
             ):
                 raise ValueError(
                     f"Managed light '{getattr(obj, 'name', '')}' has unsupported non-default scale"
@@ -2672,17 +2958,13 @@ def _preflight_managed_state(
                         "references a managed light"
                     )
             for id_owner in (owner, getattr(owner, "data", None)):
-                if id_owner is not None and _drivers_reference_targets(
-                    id_owner, managed_targets
-                ):
+                if id_owner is not None and _drivers_reference_targets(id_owner, managed_targets):
                     raise ValueError(
                         f"Object '{getattr(owner, 'name', '')}' has a driver that "
                         "references a managed light"
                     )
         for collection_name in ("scenes", "worlds", "materials", "cameras"):
-            for owner in _iter_values(
-                getattr(getattr(bpy, "data", None), collection_name, None)
-            ):
+            for owner in _iter_values(getattr(getattr(bpy, "data", None), collection_name, None)):
                 if _rna_identity(owner) in managed_targets:
                     continue
                 if _drivers_reference_targets(owner, managed_targets):
@@ -2726,7 +3008,9 @@ def _validate_plan(params: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     mode = str(params.get("mode", "PATCH_MANAGED")).upper()
     if mode not in {"REPLACE_MANAGED", "PATCH_MANAGED"}:
         raise ValueError("mode must be REPLACE_MANAGED or PATCH_MANAGED")
-    collection_name = _safe_name(params.get("collection_name", MANAGED_COLLECTION), "collection_name")
+    collection_name = _safe_name(
+        params.get("collection_name", MANAGED_COLLECTION), "collection_name"
+    )
     plan_id = params.get("plan_id")
     if plan_id is not None:
         plan_id = _safe_name(plan_id, "plan_id", identifier=True)
@@ -2735,7 +3019,10 @@ def _validate_plan(params: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         raise ValueError(
             f"lights must be an array of at most {MAX_MANAGED_LIGHTS} LightSpec objects"
         )
-    lights = [_validate_light_spec(value, index, strict, warnings) for index, value in enumerate(raw_lights)]
+    lights = [
+        _validate_light_spec(value, index, strict, warnings)
+        for index, value in enumerate(raw_lights)
+    ]
     ids = [value["id"] for value in lights]
     if len(set(ids)) != len(ids):
         raise ValueError("lights contains duplicate ids")
@@ -2745,7 +3032,10 @@ def _validate_plan(params: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     raw_remove = params.get("remove_ids", [])
     if not isinstance(raw_remove, list) or len(raw_remove) > MAX_MANAGED_LIGHTS:
         raise ValueError(f"remove_ids must be an array of at most {MAX_MANAGED_LIGHTS} ids")
-    remove_ids = [_safe_name(value, f"remove_ids[{index}]", identifier=True) for index, value in enumerate(raw_remove)]
+    remove_ids = [
+        _safe_name(value, f"remove_ids[{index}]", identifier=True)
+        for index, value in enumerate(raw_remove)
+    ]
     if len(set(remove_ids)) != len(remove_ids):
         raise ValueError("remove_ids contains duplicates")
     overlap = set(ids) & set(remove_ids)
@@ -2753,19 +3043,17 @@ def _validate_plan(params: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         raise ValueError(f"ids cannot appear in both lights and remove_ids: {sorted(overlap)}")
     expected = params.get("expected_geometry_revision")
     if expected is not None:
-        expected = _integer(
-            expected, "expected_geometry_revision", minimum=0, maximum=2**63 - 1
-        )
+        expected = _integer(expected, "expected_geometry_revision", minimum=0, maximum=2**63 - 1)
     normalized = {
-            "plan_id": plan_id,
-            "mode": mode,
-            "expected_geometry_revision": expected,
-            "collection_name": collection_name,
-            "lights": lights,
-            "remove_ids": remove_ids,
-            "scene_overrides": _validate_scene_overrides(params.get("scene_overrides")),
-            "strict": strict,
-        }
+        "plan_id": plan_id,
+        "mode": mode,
+        "expected_geometry_revision": expected,
+        "collection_name": collection_name,
+        "lights": lights,
+        "remove_ids": remove_ids,
+        "scene_overrides": _validate_scene_overrides(params.get("scene_overrides")),
+        "strict": strict,
+    }
     _preflight_managed_state(
         bpy.context.scene,
         collection_name,
@@ -2871,21 +3159,15 @@ def _scene_collection(scene: Any, name: str) -> Any | None:
     if collection is None:
         return None
     if not _collection_in_scene(scene, collection):
-        raise ValueError(
-            f"Collection '{name}' exists but is linked only to another scene"
-        )
+        raise ValueError(f"Collection '{name}' exists but is linked only to another scene")
     other_owners = [
         owner
         for owner in _collection_scene_owners(collection)
-        if owner is not scene
-        and str(getattr(owner, "name", ""))
-        != str(getattr(scene, "name", ""))
+        if owner is not scene and str(getattr(owner, "name", "")) != str(getattr(scene, "name", ""))
     ]
     if other_owners:
         owner_names = sorted(str(getattr(owner, "name", "")) for owner in other_owners)
-        raise ValueError(
-            f"Collection '{name}' is shared with other scenes: {owner_names}"
-        )
+        raise ValueError(f"Collection '{name}' is shared with other scenes: {owner_names}")
     return collection
 
 
@@ -2903,9 +3185,7 @@ def _ensure_collection(scene: Any, name: str) -> Any:
                 pass
             raise
     elif not bool(_custom_get(collection, MANAGED_PROP, False)):
-        raise ValueError(
-            f"Collection '{name}' exists but is not marked as blend-ai managed"
-        )
+        raise ValueError(f"Collection '{name}' exists but is not marked as blend-ai managed")
     return collection
 
 
@@ -2973,8 +3253,17 @@ def _replace_light_data(obj: Any, spec: dict[str, Any], plan_id: str | None) -> 
     return data
 
 
-def _aim_object(obj: Any, target: list[float]) -> None:
-    direction = _sub(target, _world_location(obj))
+def _aim_object(
+    obj: Any,
+    target: list[float],
+    *,
+    origin: list[float] | None = None,
+) -> None:
+    # Immediately after PATCH assigns ``obj.location``, Blender may still
+    # expose the previous translation through ``matrix_world`` until the next
+    # depsgraph update.  Aim from the validated plan position when available so
+    # the quaternion cannot be computed from that stale transform.
+    direction = _sub(target, origin if origin is not None else _world_location(obj))
     _normalize(direction, "light target direction")
     try:
         from mathutils import Vector
@@ -2983,7 +3272,9 @@ def _aim_object(obj: Any, target: list[float]) -> None:
         obj.rotation_mode = "QUATERNION"
         obj.rotation_quaternion = quaternion
     except Exception as exc:
-        raise RuntimeError(f"Unable to aim managed light '{getattr(obj, 'name', '')}': {exc}") from exc
+        raise RuntimeError(
+            f"Unable to aim managed light '{getattr(obj, 'name', '')}': {exc}"
+        ) from exc
 
 
 def _apply_light_spec(obj: Any, spec: dict[str, Any], plan_id: str | None) -> None:
@@ -3020,7 +3311,7 @@ def _apply_light_spec(obj: Any, spec: dict[str, Any], plan_id: str | None) -> No
     if spec.get("target_object") is not None:
         target = _world_location(_resolve_target(spec["target_object"]))
     if target is not None and spec["type"] != "POINT":
-        _aim_object(obj, target)
+        _aim_object(obj, target, origin=spec["location_world"])
 
 
 def _snapshot_extra_light_data(data: Any) -> dict[str, Any]:
@@ -3083,7 +3374,9 @@ def _serialize_managed_light(obj: Any) -> dict[str, Any]:
         "type": str(getattr(data, "type", "")),
         "location_world": _world_location(obj),
         "rotation_mode": str(getattr(obj, "rotation_mode", "XYZ")),
-        "rotation_quaternion": _sequence(getattr(obj, "rotation_quaternion", (1.0, 0.0, 0.0, 0.0)), 4),
+        "rotation_quaternion": _sequence(
+            getattr(obj, "rotation_quaternion", (1.0, 0.0, 0.0, 0.0)), 4
+        ),
         "rotation_euler": _sequence(getattr(obj, "rotation_euler", (0.0, 0.0, 0.0)), 3),
         "energy": float(getattr(data, "energy", 0.0)),
         "color_rgb": _sequence(getattr(data, "color", (1.0, 1.0, 1.0)), 3),
@@ -3104,7 +3397,9 @@ def _serialize_managed_light(obj: Any) -> dict[str, Any]:
         result["size"] = float(getattr(data, "size", 1.0))
         result["size_y"] = float(getattr(data, "size_y", result["size"]))
     elif result["type"] == "SPOT":
-        result["spot_angle_degrees"] = math.degrees(float(getattr(data, "spot_size", math.radians(45.0))))
+        result["spot_angle_degrees"] = math.degrees(
+            float(getattr(data, "spot_size", math.radians(45.0)))
+        )
         result["spot_blend"] = float(getattr(data, "spot_blend", 0.15))
     return result
 
@@ -3125,7 +3420,9 @@ def _world_snapshot(scene: Any) -> dict[str, Any] | None:
     for node in _iter_values(getattr(getattr(world, "node_tree", None), "nodes", None)):
         if str(getattr(node, "type", "")) == "BACKGROUND":
             try:
-                result["background_color_rgb"] = _sequence(node.inputs["Color"].default_value, 4)[:3]
+                result["background_color_rgb"] = _sequence(node.inputs["Color"].default_value, 4)[
+                    :3
+                ]
                 result["strength"] = float(node.inputs["Strength"].default_value)
             except Exception:
                 pass
@@ -3197,9 +3494,7 @@ def _restore_light(collection: Any, item: dict[str, Any], obj: Any | None = None
         obj = _new_light_object(collection, spec, item.get("plan_id"))
     _apply_light_spec(obj, spec, item.get("plan_id"))
     _restore_extra_light_data(getattr(obj, "data", None), item.get("extra_light_data"))
-    _restore_cycles_light_data(
-        getattr(obj, "data", None), item.get("cycles_light_data")
-    )
+    _restore_cycles_light_data(getattr(obj, "data", None), item.get("cycles_light_data"))
     obj.data.name = item.get("data_name", item["name"])
     obj.rotation_mode = item.get("rotation_mode", "XYZ")
     quaternion = item.get("rotation_quaternion")
@@ -3213,7 +3508,9 @@ def _restore_light(collection: Any, item: dict[str, Any], obj: Any | None = None
     return obj
 
 
-def _set_managed_world(world: Any, color: list[float], strength: float, plan_id: str | None) -> None:
+def _set_managed_world(
+    world: Any, color: list[float], strength: float, plan_id: str | None
+) -> None:
     _custom_set(world, MANAGED_PROP, True)
     _custom_set(world, MANAGED_PLAN_PROP, plan_id or "")
     world.color = tuple(color)
@@ -3275,9 +3572,7 @@ def _restore_world(scene: Any, snapshot: dict[str, Any] | None) -> None:
     else:
         restored_world = _lookup(getattr(bpy.data, "worlds", None), snapshot["name"])
         if restored_world is None:
-            raise RuntimeError(
-                f"World '{snapshot['name']}' needed for rollback no longer exists"
-            )
+            raise RuntimeError(f"World '{snapshot['name']}' needed for rollback no longer exists")
         # Transaction worlds never mutate the previous world in place, so
         # rollback restores only the pointer. Rebuilding the old node tree here
         # could alter another scene that shares it.
@@ -3326,9 +3621,7 @@ def _restore_scene(scene: Any, snapshot: dict[str, Any]) -> None:
             f"Collection '{snapshot['collection_name']}' is no longer marked as blend-ai managed"
         )
     current = _managed_map(collection)
-    desired_items = {
-        str(item["id"]): item for item in snapshot.get("managed_lights", [])
-    }
+    desired_items = {str(item["id"]): item for item in snapshot.get("managed_lights", [])}
     if len(desired_items) != len(snapshot.get("managed_lights", [])):
         raise RuntimeError("Rollback snapshot contains duplicate managed light IDs")
     for light_id in sorted(set(current) - set(desired_items)):
@@ -3354,7 +3647,11 @@ def _restore_scene(scene: Any, snapshot: dict[str, Any]) -> None:
         view_settings.exposure = snapshot["exposure"]
     for item in snapshot.get("non_managed_visibility", []):
         obj = _lookup(getattr(bpy.data, "objects", None), item["name"])
-        if obj is not None and str(getattr(obj, "type", "")) == "LIGHT" and not _is_managed_light(obj):
+        if (
+            obj is not None
+            and str(getattr(obj, "type", "")) == "LIGHT"
+            and not _is_managed_light(obj)
+        ):
             obj.hide_render = item["hide_render"]
             obj.hide_viewport = item["hide_viewport"]
 
@@ -3436,9 +3733,7 @@ def _persist_ledger() -> None:
             text = texts.new(LEDGER_TEXT)
             created = True
             if str(getattr(text, "name", "")) != LEDGER_TEXT:
-                raise RuntimeError(
-                    f"Unable to create the dedicated Text datablock '{LEDGER_TEXT}'"
-                )
+                raise RuntimeError(f"Unable to create the dedicated Text datablock '{LEDGER_TEXT}'")
             _custom_set(text, LEDGER_PROP, True)
         text.clear()
         text.write(_ledger_payload())
@@ -3507,7 +3802,9 @@ def _store_transaction(entry: dict[str, Any]) -> None:
             _release_snapshot_world({"world": world_snapshot})
 
 
-def _find_transaction(transaction_id: str | None, plan_id: str | None) -> tuple[str, dict[str, Any]]:
+def _find_transaction(
+    transaction_id: str | None, plan_id: str | None
+) -> tuple[str, dict[str, Any]]:
     _load_ledger()
     if not _ledger:
         raise ValueError("No rollback transactions are available")
@@ -3542,14 +3839,10 @@ def _rollback(params: dict[str, Any]) -> dict[str, Any]:
     scene = bpy.context.scene
     strict = params.get("strict", True)
     _bool(strict, "strict")
-    expected_scene = entry.get("scene_name") or entry.get("snapshot", {}).get(
-        "scene_name"
-    )
+    expected_scene = entry.get("scene_name") or entry.get("snapshot", {}).get("scene_name")
     current_scene = str(getattr(scene, "name", ""))
     if not isinstance(expected_scene, str) or not expected_scene:
-        raise ValueError(
-            f"Rollback transaction '{transaction_id}' lacks a scene identity"
-        )
+        raise ValueError(f"Rollback transaction '{transaction_id}' lacks a scene identity")
     if current_scene != expected_scene:
         raise ValueError(
             f"Rollback transaction '{transaction_id}' belongs to scene "
@@ -3567,8 +3860,7 @@ def _rollback(params: dict[str, Any]) -> dict[str, Any]:
         current_revision = spatial_cache.get_revisions()["geometry_revision"]
         if expected_revision != current_revision:
             raise ValueError(
-                f"Stale geometry revision: expected {expected_revision}, current "
-                f"{current_revision}"
+                f"Stale geometry revision: expected {expected_revision}, current {current_revision}"
             )
     _preflight_managed_state(
         scene,
@@ -3580,9 +3872,7 @@ def _rollback(params: dict[str, Any]) -> dict[str, Any]:
         scene,
         target_snapshot["collection_name"],
         entry.get("plan_id"),
-        snapshot_non_managed_visibility=bool(
-            target_snapshot.get("non_managed_visibility")
-        ),
+        snapshot_non_managed_visibility=bool(target_snapshot.get("non_managed_visibility")),
     )
     previous_ledger = list(_ledger.items())
     spatial_cache.begin_managed_edit()
@@ -3737,9 +4027,7 @@ def _light_spec_would_change(obj: Any, spec: dict[str, Any], plan_id: str) -> bo
             math.degrees(float(getattr(data, "spot_size", 0.0))),
             spec["spot_angle_degrees"],
         )
-        or not _state_values_equal(
-            getattr(data, "spot_blend", None), spec["spot_blend"]
-        )
+        or not _state_values_equal(getattr(data, "spot_blend", None), spec["spot_blend"])
     ):
         return True
 
@@ -3750,9 +4038,7 @@ def _light_spec_would_change(obj: Any, spec: dict[str, Any], plan_id: str) -> bo
         try:
             from mathutils import Vector
 
-            expected = Vector(_sub(target, spec["location_world"])).to_track_quat(
-                "-Z", "Y"
-            )
+            expected = Vector(_sub(target, spec["location_world"])).to_track_quat("-Z", "Y")
             actual = getattr(obj, "rotation_quaternion", None)
             if str(getattr(obj, "rotation_mode", "")) != "QUATERNION" or actual is None:
                 return True
@@ -3783,8 +4069,7 @@ def _propose_plan_changes(scene: Any, normalized: dict[str, Any]) -> dict[str, A
         if collision is not None and light_id not in existing:
             owner = str(_custom_get(collision, MANAGED_PLAN_PROP, "")) or "<unknown>"
             raise ValueError(
-                f"Managed light id '{light_id}' belongs to plan '{owner}', not "
-                f"'{plan_id}'"
+                f"Managed light id '{light_id}' belongs to plan '{owner}', not '{plan_id}'"
             )
         _assert_display_name_available(spec, existing.get(light_id))
 
@@ -3823,14 +4108,11 @@ def _propose_plan_changes(scene: Any, normalized: dict[str, Any]) -> dict[str, A
         muted_names.sort()
         already_muted_names.sort()
 
-    create_ids = [
-        spec["id"] for spec in normalized["lights"] if spec["id"] not in existing
-    ]
+    create_ids = [spec["id"] for spec in normalized["lights"] if spec["id"] not in existing]
     update_ids = [
         spec["id"]
         for spec in normalized["lights"]
-        if spec["id"] in existing
-        and _light_spec_would_change(existing[spec["id"]], spec, plan_id)
+        if spec["id"] in existing and _light_spec_would_change(existing[spec["id"]], spec, plan_id)
     ]
     unchanged_ids = [
         spec["id"]
@@ -3838,9 +4120,7 @@ def _propose_plan_changes(scene: Any, normalized: dict[str, Any]) -> dict[str, A
         if spec["id"] in existing and spec["id"] not in update_ids
     ]
     exposure_override = normalized["scene_overrides"]["exposure"]
-    current_exposure = float(
-        getattr(getattr(scene, "view_settings", None), "exposure", 0.0)
-    )
+    current_exposure = float(getattr(getattr(scene, "view_settings", None), "exposure", 0.0))
 
     return {
         "plan_id": plan_id,
@@ -3857,8 +4137,7 @@ def _propose_plan_changes(scene: Any, normalized: dict[str, Any]) -> dict[str, A
         "mute_non_managed_light_names": muted_names,
         "already_muted_non_managed_light_names": already_muted_names,
         "world_override": normalized["scene_overrides"]["world"],
-        "world_will_change": normalized["scene_overrides"]["world"]["mode"]
-        == "MANAGED_SOLID",
+        "world_will_change": normalized["scene_overrides"]["world"]["mode"] == "MANAGED_SOLID",
         "exposure_override": exposure_override,
         "exposure_will_change": exposure_override is not None
         and not _state_values_equal(current_exposure, exposure_override),
@@ -3888,7 +4167,11 @@ def handle_apply_light_plan(params: dict[str, Any]) -> dict[str, Any]:
     if action not in {"VALIDATE", "APPLY", "ROLLBACK"}:
         raise ValueError("action must be VALIDATE, APPLY, or ROLLBACK")
     if action == "ROLLBACK":
-        if params.get("lights") or params.get("remove_ids") or params.get("scene_overrides") is not None:
+        if (
+            params.get("lights")
+            or params.get("remove_ids")
+            or params.get("scene_overrides") is not None
+        ):
             raise ValueError("ROLLBACK does not accept lights, remove_ids, or scene_overrides")
         return _rollback(params)
 
@@ -3927,9 +4210,7 @@ def handle_apply_light_plan(params: dict[str, Any]) -> dict[str, Any]:
     for source_spec in normalized["lights"]:
         spec = dict(source_spec)
         if spec.get("target_object") is not None:
-            spec["target_point"] = _world_location(
-                _resolve_target(spec["target_object"])
-            )
+            spec["target_point"] = _world_location(_resolve_target(spec["target_object"]))
             spec["target_object"] = None
         apply_specs.append(spec)
 
@@ -3938,8 +4219,7 @@ def handle_apply_light_plan(params: dict[str, Any]) -> dict[str, Any]:
         normalized["collection_name"],
         normalized["plan_id"],
         snapshot_non_managed_visibility=(
-            normalized["scene_overrides"]["existing_light_policy"]
-            == "MUTE_NON_MANAGED"
+            normalized["scene_overrides"]["existing_light_policy"] == "MUTE_NON_MANAGED"
         ),
     )
     transaction_id = uuid.uuid4().hex

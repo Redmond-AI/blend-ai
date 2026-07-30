@@ -105,3 +105,65 @@ class TestClientCleanup:
         server._handle_client(mock_client)
 
         mock_client.close.assert_called()
+
+
+class TestRenderSafeCommands:
+    """Only profile-batch observation and cancellation bypass render busy."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "get_look_render_batch",
+            "cancel_look_render_batch",
+            "get_look_render_result",
+        ],
+    )
+    def test_profile_batch_commands_are_allowed(self, server_module, command):
+        assert server_module._command_allowed_during_render(command) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        ["execute_code", "apply_light_plan", "upsert_look_profile", "render_image"],
+    )
+    def test_mutating_commands_remain_blocked(self, server_module, command):
+        assert server_module._command_allowed_during_render(command) is False
+
+    def test_safe_status_dispatch_bypasses_render_blocked_main_timer(
+        self,
+        server_module,
+    ):
+        server_module.dispatcher.reset_mock()
+        server_module.thread_safety.reset_mock()
+        server_module.render_guard.is_rendering = True
+        server_module.dispatcher.dispatch.return_value = {
+            "status": "ok",
+            "result": {"status": "RUNNING"},
+        }
+
+        response = server_module._dispatch_command(
+            "get_look_render_batch",
+            {"batch_id": "lookbatch-test"},
+        )
+
+        assert response["result"]["status"] == "RUNNING"
+        server_module.dispatcher.dispatch.assert_called_once_with(
+            "get_look_render_batch",
+            {"batch_id": "lookbatch-test"},
+        )
+        server_module.thread_safety.execute_on_main_thread.assert_not_called()
+        server_module.render_guard.is_rendering = False
+
+    def test_non_safe_command_still_returns_busy_without_dispatch(
+        self,
+        server_module,
+    ):
+        server_module.dispatcher.reset_mock()
+        server_module.thread_safety.reset_mock()
+        server_module.render_guard.is_rendering = True
+
+        response = server_module._dispatch_command("execute_code", {})
+
+        assert response["status"] == "busy"
+        server_module.dispatcher.dispatch.assert_not_called()
+        server_module.thread_safety.execute_on_main_thread.assert_not_called()
+        server_module.render_guard.is_rendering = False

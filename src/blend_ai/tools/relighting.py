@@ -136,9 +136,7 @@ def _validate_safe_strings(
             raise ValidationError(f"{name}[{index}] must be a non-empty string")
         value = value.strip()
         if len(value) > max_length:
-            raise ValidationError(
-                f"{name}[{index}] must be at most {max_length} characters"
-            )
+            raise ValidationError(f"{name}[{index}] must be at most {max_length} characters")
         if any(ord(character) < 32 for character in value):
             raise ValidationError(f"{name}[{index}] contains control characters")
         normalized.append(value)
@@ -373,7 +371,9 @@ class LightSpec(BaseModel):
             maximum=180.0,
         )
 
-    @field_validator("spot_blend", "diffuse_factor", "specular_factor", "volume_factor", mode="before")
+    @field_validator(
+        "spot_blend", "diffuse_factor", "specular_factor", "volume_factor", mode="before"
+    )
     @classmethod
     def validate_factor(cls, value: Any, info: Any) -> float | None:
         if value is None:
@@ -384,7 +384,9 @@ class LightSpec(BaseModel):
     def validate_type_specific_fields(self) -> LightSpec:
         if self.target_point is not None and self.target_object is not None:
             raise ValueError("target_point and target_object are mutually exclusive")
-        if self.type == "POINT" and (self.target_point is not None or self.target_object is not None):
+        if self.type == "POINT" and (
+            self.target_point is not None or self.target_object is not None
+        ):
             raise ValueError("POINT lights do not accept targets")
 
         if self.type != "SUN" and self.sun_angle_degrees is not None:
@@ -458,11 +460,14 @@ class CaptureMetadata(BaseModel):
     area_index: int | None = None
     camera_name: str | None = None
     engine: str | None = None
-    capture_backend: Literal[
-        "BLENDER_SCREENSHOT_AREA",
-        "MACOS_SCREENCAPTUREKIT",
-        "QUICK_CYCLES_RENDER",
-    ] | None = None
+    capture_backend: (
+        Literal[
+            "BLENDER_SCREENSHOT_AREA",
+            "MACOS_SCREENCAPTUREKIT",
+            "QUICK_CYCLES_RENDER",
+        ]
+        | None
+    ) = None
     requested_preview_samples: int | None = None
     denoise: bool | None = None
     device: str | None = None
@@ -475,6 +480,8 @@ class CaptureMetadata(BaseModel):
     format: Literal["JPEG", "PNG"] | None = None
     jpeg_quality: int | None = None
     byte_count: int | None = None
+    staging_path: str | None = None
+    staging_sha256: str | None = None
     keep_session: bool | None = None
     restored: bool = False
     warnings: list[str] = Field(default_factory=list)
@@ -664,9 +671,7 @@ def apply_light_plan(
     if len(remove_ids) > MAX_LIGHTS:
         raise ValidationError(f"remove_ids may contain at most {MAX_LIGHTS} entries")
     try:
-        remove_ids = [
-            _validate_identifier(remove_id, name="remove id") for remove_id in remove_ids
-        ]
+        remove_ids = [_validate_identifier(remove_id, name="remove id") for remove_id in remove_ids]
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
     if len(remove_ids) != len(set(remove_ids)):
@@ -681,9 +686,7 @@ def apply_light_plan(
         if transaction_id is None and plan_id is None:
             raise ValidationError("ROLLBACK requires transaction_id or plan_id")
         if light_models or remove_ids or scene_overrides is not None:
-            raise ValidationError(
-                "ROLLBACK does not accept lights, remove_ids, or scene_overrides"
-            )
+            raise ValidationError("ROLLBACK does not accept lights, remove_ids, or scene_overrides")
     else:
         if plan_id is None:
             raise ValidationError(f"plan_id is required for {action}")
@@ -731,9 +734,7 @@ def _ensure_macos_capture_helper() -> Path:
         if _MACOS_CAPTURE_HELPER is not None and _MACOS_CAPTURE_HELPER.is_file():
             return _MACOS_CAPTURE_HELPER
         if not _MACOS_CAPTURE_SOURCE.is_file():
-            raise RuntimeError(
-                f"Bundled macOS capture source is missing: {_MACOS_CAPTURE_SOURCE}"
-            )
+            raise RuntimeError(f"Bundled macOS capture source is missing: {_MACOS_CAPTURE_SOURCE}")
         swiftc = shutil.which("swiftc")
         if swiftc is None:
             raise RuntimeError(
@@ -759,9 +760,7 @@ def _ensure_macos_capture_helper() -> Path:
         if completed.returncode != 0 or not helper.is_file():
             helper.unlink(missing_ok=True)
             detail = (completed.stderr or completed.stdout or "unknown swiftc error").strip()
-            raise RuntimeError(
-                "Could not compile macOS capture helper: " + detail[:2000]
-            )
+            raise RuntimeError("Could not compile macOS capture helper: " + detail[:2000])
         _MACOS_CAPTURE_HELPER = helper
         atexit.register(_remove_macos_capture_helper)
         return helper
@@ -823,15 +822,11 @@ def _capture_macos_window(
             raise RuntimeError(f"macOS ScreenCaptureKit capture failed: {exc}") from exc
         if completed.returncode != 0 or not output_path.is_file():
             detail = (completed.stderr or completed.stdout or "unknown capture error").strip()
-            raise RuntimeError(
-                "macOS ScreenCaptureKit capture failed: " + detail[:2000]
-            )
+            raise RuntimeError("macOS ScreenCaptureKit capture failed: " + detail[:2000])
         try:
             helper_metadata = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "macOS ScreenCaptureKit helper returned invalid metadata"
-            ) from exc
+            raise RuntimeError("macOS ScreenCaptureKit helper returned invalid metadata") from exc
         try:
             byte_count = output_path.stat().st_size
         except OSError as exc:
@@ -877,9 +872,7 @@ def _capture_macos_window(
     def metadata_int(container: dict[str, Any], name: str) -> int:
         value = container.get(name)
         if isinstance(value, bool) or not isinstance(value, int):
-            raise RuntimeError(
-                f"macOS ScreenCaptureKit metadata {name} must be an integer"
-            )
+            raise RuntimeError(f"macOS ScreenCaptureKit metadata {name} must be an integer")
         return value
 
     if metadata_int(helper_metadata, "ownerPID") != process_id:
@@ -1011,6 +1004,99 @@ def _encode_capture_image(
     )
 
 
+def _validate_capture_staging_path(
+    value: str,
+    *,
+    output_format: Literal["JPEG", "PNG"],
+) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("staging_path must be a non-empty absolute path")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValidationError("staging_path must be an absolute path")
+    expected_suffixes = {".jpg", ".jpeg"} if output_format == "JPEG" else {".png"}
+    if path.suffix.lower() not in expected_suffixes:
+        expected = ".jpg or .jpeg" if output_format == "JPEG" else ".png"
+        raise ValidationError(f"staging_path must end in {expected} for {output_format}")
+    if not path.parent.is_dir():
+        raise ValidationError("staging_path parent directory must already exist")
+    if path.exists() or path.is_symlink():
+        raise ValidationError("staging_path already exists; capture staging never overwrites")
+    return path
+
+
+def _stage_capture_bytes(
+    image_bytes: bytes,
+    destination: Path,
+    output_format: Literal["JPEG", "PNG"],
+    output_width: int,
+    output_height: int,
+) -> str:
+    """Atomically create one validated exact-byte capture artifact."""
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(image_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        try:
+            with PILImage.open(temporary_path) as image:
+                actual_format = str(image.format or "").upper()
+                actual_size = image.size
+                image.verify()
+        except (
+            PILImage.DecompressionBombError,
+            UnidentifiedImageError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise RuntimeError("staged viewport capture failed image validation") from exc
+        if actual_format != output_format:
+            raise RuntimeError(
+                f"staged viewport capture format mismatch: {actual_format} != {output_format}"
+            )
+        if actual_size != (output_width, output_height):
+            raise RuntimeError("staged viewport capture dimensions do not match the encoded result")
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        if temporary_path.stat().st_size != len(image_bytes):
+            raise RuntimeError("staged viewport capture byte count does not match")
+
+        # Linking a fully flushed same-directory temporary file publishes the
+        # artifact atomically and fails if another process claimed the literal
+        # ledger path.  Unlike os.replace(), this can never overwrite evidence.
+        try:
+            os.link(temporary_path, destination)
+        except FileExistsError as exc:
+            raise RuntimeError(
+                "staging_path already exists; capture staging never overwrites"
+            ) from exc
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # The image file itself is already flushed and atomically visible;
+            # some filesystems do not permit opening directories for fsync.
+            pass
+        return digest
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _capture_result(
     metadata: CaptureMetadata,
     image_bytes: bytes | None = None,
@@ -1018,7 +1104,9 @@ def _capture_result(
     content: list[Any] = []
     if image_bytes is not None:
         assert metadata.format is not None
-        content.append(MCPImage(data=image_bytes, format=metadata.format.lower()).to_image_content())
+        content.append(
+            MCPImage(data=image_bytes, format=metadata.format.lower()).to_image_content()
+        )
     # The MCP specification recommends duplicating structured output as text
     # for clients that predate structuredContent.
     content.append(TextContent(type="text", text=metadata.model_dump_json()))
@@ -1044,6 +1132,7 @@ async def capture_cycles_viewport(
     format: Literal["JPEG", "PNG"] = "JPEG",
     jpeg_quality: int = 85,
     keep_session: bool = True,
+    staging_path: str | None = None,
 ) -> Annotated[CallToolResult, CaptureMetadata]:
     """Capture pixels from a live Cycles Rendered viewport as native MCP image content.
 
@@ -1063,6 +1152,8 @@ async def capture_cycles_viewport(
             raise ValidationError(str(exc)) from exc
 
     if action == "RESTORE":
+        if staging_path is not None:
+            raise ValidationError("staging_path is only valid for action='CAPTURE'")
         restore_started = time.perf_counter()
         result = await _send_relighting_command_async(
             "restore_cycles_viewport",
@@ -1111,6 +1202,11 @@ async def capture_cycles_viewport(
         raise ValidationError("denoise must be a boolean")
     if not isinstance(keep_session, bool):
         raise ValidationError("keep_session must be a boolean")
+    resolved_staging_path = (
+        _validate_capture_staging_path(staging_path, output_format=format)
+        if staging_path is not None
+        else None
+    )
 
     prepare_params = {
         "session_id": session_id,
@@ -1170,10 +1266,7 @@ async def capture_cycles_viewport(
             "BLENDER_SCREENSHOT_AREA",
         )
         use_quick_render = capture_mode == "QUICK_RENDER"
-        use_macos_capture = (
-            not use_quick_render
-            and requested_backend == "MACOS_SCREENCAPTUREKIT"
-        )
+        use_macos_capture = not use_quick_render and requested_backend == "MACOS_SCREENCAPTUREKIT"
         if use_macos_capture and sys.platform != "darwin":
             raise RuntimeError(
                 "Blender requested macOS ScreenCaptureKit from a non-macOS MCP process"
@@ -1236,9 +1329,7 @@ async def capture_cycles_viewport(
                 source_height = int(source_height)
             region_rect = captured.get("region_rect")
             captured["capture_backend"] = (
-                "QUICK_CYCLES_RENDER"
-                if use_quick_render
-                else "BLENDER_SCREENSHOT_AREA"
+                "QUICK_CYCLES_RENDER" if use_quick_render else "BLENDER_SCREENSHOT_AREA"
             )
             if use_quick_render and not keep_session:
                 restored = await _send_relighting_command_async(
@@ -1267,6 +1358,18 @@ async def capture_cycles_viewport(
             jpeg_quality=jpeg_quality,
         )
         timings_ms["encode"] = (time.perf_counter() - encoding_started) * 1000.0
+        staging_sha256: str | None = None
+        if resolved_staging_path is not None:
+            staging_started = time.perf_counter()
+            staging_sha256 = await _to_thread_cancellation_safe(
+                _stage_capture_bytes,
+                image_bytes,
+                resolved_staging_path,
+                format,
+                output_width,
+                output_height,
+            )
+            timings_ms["stage"] = (time.perf_counter() - staging_started) * 1000.0
         timings_ms["total"] = (time.perf_counter() - started) * 1000.0
 
         metadata = CaptureMetadata(
@@ -1286,12 +1389,8 @@ async def capture_cycles_viewport(
             requested_preview_samples=preview_samples,
             denoise=captured.get("denoise", prepared.get("denoise", denoise)),
             device=captured.get("device", prepared.get("device", device)),
-            settle_basis=(
-                "elapsed" if capture_mode == "VIEWPORT" else "not_applicable"
-            ),
-            settle_seconds=(
-                float(settle_seconds) if capture_mode == "VIEWPORT" else 0.0
-            ),
+            settle_basis=("elapsed" if capture_mode == "VIEWPORT" else "not_applicable"),
+            settle_seconds=(float(settle_seconds) if capture_mode == "VIEWPORT" else 0.0),
             source_width=actual_source_width,
             source_height=actual_source_height,
             output_width=output_width,
@@ -1299,6 +1398,10 @@ async def capture_cycles_viewport(
             format=format,
             jpeg_quality=jpeg_quality if format == "JPEG" else None,
             byte_count=len(image_bytes),
+            staging_path=(
+                str(resolved_staging_path) if resolved_staging_path is not None else None
+            ),
+            staging_sha256=staging_sha256,
             keep_session=keep_session,
             restored=bool(captured.get("restored", not keep_session)),
             warnings=(

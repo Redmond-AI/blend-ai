@@ -51,9 +51,10 @@ wheels = [
 
 [[package]]
 name = "blend-ai"
-version = "1.2.1"
+version = "1.4.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp" },
     { name = "pillow" },
     { name = "pydantic" },
@@ -72,6 +73,7 @@ installer = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27,<1" },
     { name = "mcp", specifier = ">=1.26.0,<2" },
     { name = "pillow", specifier = ">=10,<13" },
     { name = "pydantic", specifier = ">=2.0" },

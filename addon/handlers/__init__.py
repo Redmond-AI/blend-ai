@@ -26,6 +26,8 @@ from . import (
     gpencil,
     relighting,
     cycles_viewport,
+    look_profiles,
+    look_profile_rendering,
 )
 
 _modules = [
@@ -54,6 +56,8 @@ _modules = [
     gpencil,
     relighting,
     cycles_viewport,
+    look_profiles,
+    look_profile_rendering,
 ]
 
 

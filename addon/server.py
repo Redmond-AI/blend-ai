@@ -14,6 +14,51 @@ from . import thread_safety
 from .render_guard import render_guard
 
 
+# These handlers are deliberately read-only or cooperative-cancellation
+# requests.  Profile renders are started with Blender's asynchronous render
+# operator, so the main-thread timer remains available while the render job is
+# active.  Keeping this allowlist explicit prevents arbitrary scene mutation
+# from racing the renderer while still making batch polling and cancellation
+# useful.
+RENDER_SAFE_COMMANDS = frozenset(
+    {
+        "get_look_render_batch",
+        "cancel_look_render_batch",
+        "get_look_render_result",
+    }
+)
+
+
+def _command_allowed_during_render(command: str) -> bool:
+    """Return whether ``command`` may run while Blender renders."""
+    return command in RENDER_SAFE_COMMANDS
+
+
+def _dispatch_command(command: str, params: dict) -> dict:
+    """Dispatch one command without waiting on a render-blocked main timer.
+
+    The three render-safe handlers operate only on the renderer's immutable
+    job definitions, status fields, cancellation flags, and completed proxy
+    files.  Running them on the socket thread keeps polling responsive during
+    shader compilation and other render phases in which Blender temporarily
+    stops servicing Python timers.  Every other command retains the normal
+    main-thread bridge.
+    """
+    if render_guard.is_rendering:
+        if not _command_allowed_during_render(command):
+            return {
+                "status": "busy",
+                "result": "Blender is currently rendering. "
+                "Command will not be processed until the render completes.",
+            }
+        return dispatcher.dispatch(command, params)
+    return thread_safety.execute_on_main_thread(
+        dispatcher.dispatch,
+        command,
+        params,
+    )
+
+
 class BlenderServer:
     """TCP socket server for receiving MCP commands inside Blender."""
 
@@ -104,19 +149,7 @@ class BlenderServer:
                     command = message.get("command", "")
                     params = message.get("params", {})
 
-                    # Check if Blender is rendering — main thread is blocked
-                    if render_guard.is_rendering:
-                        response = {
-                            "status": "busy",
-                            "result": "Blender is currently rendering. "
-                                      "Command will not be processed until "
-                                      "the render completes.",
-                        }
-                    else:
-                        # Execute on main thread via thread_safety
-                        response = thread_safety.execute_on_main_thread(
-                            dispatcher.dispatch, command, params
-                        )
+                    response = _dispatch_command(command, params)
 
                     response_data = json.dumps(response).encode("utf-8")
                     self._send_message(client, response_data)

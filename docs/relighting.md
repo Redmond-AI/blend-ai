@@ -1,9 +1,9 @@
 # Spatial, vision-guided relighting
 
 This fork adds a bounded spatial-lighting layer to `blend-ai`. It is based on
-upstream commit `621ddc0dc8b379428e027c17ce817e1fc4d9cb36`. At that commit the
-latest GitHub release is labelled `v1.2.2`, while `pyproject.toml`, the Blender
-manifest, and the add-on metadata identify the code as `1.2.1`.
+upstream commit `621ddc0dc8b379428e027c17ce817e1fc4d9cb36`; the current fork
+metadata is version `1.4.0` for the cinematic-review and persistent look-profile
+feature release.
 
 The original screenshot tool is intentionally unchanged. Relighting uses four
 new tools:
@@ -24,6 +24,11 @@ new tools:
   not mean unoccluded.
 - An opening candidate is semantic/geometry evidence and is always labelled
   `heuristic: true`. Use raycasts to establish a clear path.
+- `batch_raycast` applies its time budget to instance indexing and acceleration
+  as well as the casts themselves. Dense preprocessing is bounded to 50,000
+  evaluated instances and 2,000,000 unique-source triangles. If a bound or the
+  deadline is reached, every requested ray is returned as explicitly unknown,
+  and no partial identity index or accelerator is cached.
 - Light-plan atomicity covers only the supported state recorded in the
   transaction snapshot. It is not a Blender-wide transaction.
 - Rollback is global last-in, first-out (LIFO), because each transaction
@@ -115,13 +120,18 @@ capture_cycles_viewport(
   denoise=true,
   max_size=1024,
   format="PNG",
-  keep_session=true
+  keep_session=true,
+  staging_path="/absolute/path/to/review_001.png"
 )
 ```
 
 The temporary source PNG is deleted after the MCP process has validated and
-encoded it. The returned native MCP image can itself be persisted by the client
-or acceptance harness when an audit artifact is wanted.
+encoded it. When `staging_path` is supplied, the MCP process independently
+validates the final dimensions and format, flushes the exact returned bytes to a
+same-directory temporary file, and atomically publishes a new destination. It
+returns the literal path and SHA-256 in capture metadata, refuses relative or
+existing paths, and never overwrites ledger evidence. This replaces terminal
+base64/EOF transfer steps for audit artifacts.
 
 ## Tests
 

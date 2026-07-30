@@ -30,6 +30,11 @@ _ALLOWED_DEVICES = {"KEEP", "CPU", "GPU"}
 # sessions would make restoration order-dependent, so only one is allowed.
 _sessions: dict[str, dict[str, Any]] = {}
 
+
+def active_session_ids() -> list[str]:
+    """Return retained viewport-session ids for cross-handler coordination."""
+    return list(_sessions)
+
 try:
     _persistent = bpy.app.handlers.persistent
 except (AttributeError, TypeError):
