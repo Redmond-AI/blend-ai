@@ -169,10 +169,34 @@ class BlenderChatSession:
 
         try:
             result = self._loop.run_until_complete(mcp.call_tool(name, arguments))
-            # call_tool returns list[TextContent] — extract the text
-            if result and hasattr(result[0], "text"):
-                return result[0].text
-            return json.dumps(result, default=str)
+            # FastMCP tools historically returned list[TextContent]. Native
+            # image tools may instead return CallToolResult with mixed content,
+            # so retain every model-visible block while preserving the old
+            # single-text behavior.
+            blocks = result.content if hasattr(result, "content") else result
+            if blocks and len(blocks) == 1 and hasattr(blocks[0], "text"):
+                return blocks[0].text
+
+            serialized = []
+            for block in blocks or []:
+                if hasattr(block, "text"):
+                    serialized.append({"type": "text", "text": block.text})
+                elif hasattr(block, "data"):
+                    serialized.append(
+                        {
+                            "type": "image",
+                            "data": block.data,
+                            "mime_type": getattr(block, "mimeType", "image/png"),
+                        }
+                    )
+                else:
+                    serialized.append({"type": "unknown", "value": str(block)})
+
+            payload: dict[str, Any] = {"content": serialized}
+            structured = getattr(result, "structuredContent", None)
+            if structured is not None:
+                payload["structured_content"] = structured
+            return json.dumps(payload, default=str)
         except Exception as e:
             return json.dumps({"status": "error", "result": str(e)})
 
@@ -284,12 +308,30 @@ class BlenderChatSession:
 
                 # If this was a screenshot, auto-analyze with vision model
                 vision_note = ""
-                if tool_name in ("get_viewport_screenshot", "fast_viewport_capture"):
+                if tool_name in (
+                    "get_viewport_screenshot",
+                    "fast_viewport_capture",
+                    "capture_cycles_viewport",
+                ):
                     try:
                         result_data = json.loads(result)
-                        if isinstance(result_data, dict) and "image" in result_data:
+                        screenshot_data = None
+                        if isinstance(result_data, dict):
+                            screenshot_data = result_data.get("image") or result_data.get(
+                                "image_base64"
+                            )
+                            if screenshot_data is None:
+                                screenshot_data = next(
+                                    (
+                                        block.get("data")
+                                        for block in result_data.get("content", [])
+                                        if block.get("type") == "image"
+                                    ),
+                                    None,
+                                )
+                        if screenshot_data:
                             print("  -> Analyzing screenshot with vision model...")
-                            analysis = self.analyze_screenshot(result_data["image"])
+                            analysis = self.analyze_screenshot(screenshot_data)
                             vision_note = f"\n\n[Vision Analysis]: {analysis}"
                     except (json.JSONDecodeError, KeyError):
                         pass

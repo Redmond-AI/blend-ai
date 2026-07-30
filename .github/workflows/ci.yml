@@ -26,7 +26,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install bandit pip-audit
+      - name: Install project and audit tools
+        # GitHub's Python 3.11 image currently ships setuptools 79.0.1, which
+        # has PYSEC-2026-3447. Upgrade the runner package, then install the
+        # project so pip-audit checks runtime dependencies rather than only
+        # the audit tools themselves.
+        run: pip install --upgrade "setuptools>=83" bandit pip-audit .
       - name: bandit
         run: bandit -r src/ -ll  # low severity threshold; skip install_addon.py (subprocess by design)
       - name: pip-audit

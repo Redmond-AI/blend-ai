@@ -64,8 +64,9 @@ class TestValidateObjectName:
         with pytest.raises(ValidationError, match="invalid characters"):
             validate_object_name("path/name")
 
-    def test_whitespace_stripping(self):
-        assert validate_object_name("  Cube  ") == "Cube"
+    def test_significant_whitespace_is_preserved(self):
+        assert validate_object_name("  Cube  ") == "  Cube  "
+        assert validate_object_name("Camera ") == "Camera "
 
     def test_only_whitespace_raises(self):
         # After stripping, empty string fails the pattern check or length
@@ -159,6 +160,16 @@ class TestValidateNumericRange:
         with pytest.raises(ValidationError, match="intensity"):
             validate_numeric_range(-1, min_val=0, name="intensity")
 
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_raises(self, value):
+        with pytest.raises(ValidationError, match="finite"):
+            validate_numeric_range(value)
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_bool_raises(self, value):
+        with pytest.raises(ValidationError, match="must be a number"):
+            validate_numeric_range(value)
+
 
 # ---------------------------------------------------------------------------
 # validate_color
@@ -204,6 +215,11 @@ class TestValidateColor:
         result = validate_color([0.5, 0.5, 0.5])
         assert isinstance(result, tuple)
 
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+    def test_non_finite_or_bool_component_raises(self, value):
+        with pytest.raises(ValidationError, match="between 0.0 and 1.0"):
+            validate_color([value, 0.0, 0.0])
+
 
 # ---------------------------------------------------------------------------
 # validate_vector
@@ -243,6 +259,15 @@ class TestValidateVector:
     def test_custom_name_in_error(self):
         with pytest.raises(ValidationError, match="rotation"):
             validate_vector([1.0, 2.0], name="rotation")
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_component_raises(self, value):
+        with pytest.raises(ValidationError, match="finite"):
+            validate_vector([0.0, value, 0.0])
+
+    def test_bool_component_raises(self):
+        with pytest.raises(ValidationError, match="must be a number"):
+            validate_vector([0.0, True, 0.0])
 
     def test_returns_tuple(self):
         result = validate_vector([0, 0, 0])

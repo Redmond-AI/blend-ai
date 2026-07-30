@@ -25,3 +25,5 @@ htmlcov/
 .python-version
 CLAUDE.md
 README.html
+artifacts/relighting/
+*_AI_RELIGHT_TEST.blend

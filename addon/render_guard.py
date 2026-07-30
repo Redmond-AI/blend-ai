@@ -22,16 +22,16 @@ class RenderGuard:
     def is_rendering(self) -> bool:
         return self._rendering.is_set()
 
-    def on_render_pre(self, scene) -> None:
-        """Called by bpy.app.handlers.render_pre."""
+    def on_render_pre(self, _scene, *_handler_args) -> None:
+        """Called by Blender's version-dependent ``render_pre`` signature."""
         self._rendering.set()
 
-    def on_render_complete(self, scene) -> None:
-        """Called by bpy.app.handlers.render_complete."""
+    def on_render_complete(self, _scene, *_handler_args) -> None:
+        """Called by Blender's version-dependent ``render_complete`` signature."""
         self._rendering.clear()
 
-    def on_render_cancel(self, scene) -> None:
-        """Called by bpy.app.handlers.render_cancel."""
+    def on_render_cancel(self, _scene, *_handler_args) -> None:
+        """Called by Blender's version-dependent ``render_cancel`` signature."""
         self._rendering.clear()
 
     def reset(self) -> bool:

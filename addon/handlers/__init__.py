@@ -24,6 +24,10 @@ from . import (
     mesh_editing,
     mesh_quality,
     gpencil,
+    relighting,
+    cycles_viewport,
+    look_profiles,
+    look_profile_rendering,
 )
 
 _modules = [
@@ -50,6 +54,10 @@ _modules = [
     code_exec,
     booltool,
     gpencil,
+    relighting,
+    cycles_viewport,
+    look_profiles,
+    look_profile_rendering,
 ]
 
 

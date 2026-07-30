@@ -27,6 +27,16 @@ class TestRenderGuard:
         guard.on_render_cancel(None)
         assert not guard.is_rendering
 
+    def test_blender_52_extra_handler_argument_is_supported(self):
+        guard = RenderGuard()
+        guard.on_render_pre(None, object())
+        assert guard.is_rendering
+        guard.on_render_complete(None, object())
+        assert not guard.is_rendering
+        guard.on_render_pre(None, object())
+        guard.on_render_cancel(None, object())
+        assert not guard.is_rendering
+
     def test_complete_without_pre_is_safe(self):
         guard = RenderGuard()
         guard.on_render_complete(None)
